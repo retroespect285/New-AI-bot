@@ -1,0 +1,345 @@
+"""The bot's per-bar cycle, shared by live trading and the backtester.
+
+Each time a bar closes (every 5 minutes on M5) ``BotCore.on_bar`` does:
+
+1. **learn**    - every trade setup whose full outcome window has now passed becomes a training
+                  sample (the model keeps learning from the market, 24/7, not only from its own trades);
+2. **account**  - update equity, daily-loss / drawdown limits and learn from the bot's closed trades;
+3. **manage**   - close positions that hit the max holding time or the Friday cut-off, optional
+                  break-even stop;
+4. **decide**   - score every arm (BUY/SELL x SL/TP profile); pick the best positive-EV arm;
+5. **execute**  - risk checks, position sizing from the stop distance, send the order with SL/TP.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tempfile
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Deque, Dict, Optional
+
+import numpy as np
+import pandas as pd
+
+from .brain import Brain, Decision
+from .brokers.base import Broker
+from .config import BotConfig
+from .features import FeatureSet, build_features
+from .journal import Journal
+from .labels import ArmLabels, label_all, make_arms
+from .risk import RiskManager, RiskState
+from .types import Position, Side, SymbolInfo, Tick
+
+log = logging.getLogger(__name__)
+
+
+def to_ns(times: pd.Series) -> np.ndarray:
+    return pd.to_datetime(times).to_numpy(dtype="datetime64[ns]").astype(np.int64)
+
+
+@dataclass
+class Prepared:
+    """Bars plus everything derived from them (features, outcome labels, int64 times)."""
+
+    bars: pd.DataFrame
+    features: FeatureSet
+    labels: Dict[str, ArmLabels]
+    times: np.ndarray
+
+
+class BotCore:
+    def __init__(self, cfg: BotConfig, broker: Broker, journal: Optional[Journal] = None,
+                 state_dir: Optional[str] = None, dry_run: bool = False):
+        self.cfg = cfg
+        self.broker = broker
+        self.journal = journal or Journal(None)
+        self.state_dir = Path(state_dir) if state_dir else None
+        self.dry_run = dry_run or cfg.trading.dry_run
+        self.arms = make_arms(cfg.model.exit_profiles)
+        self.tf = pd.Timedelta(minutes=cfg.timeframe_minutes)
+        self.tf_ns = int(self.tf.value)
+        self.infos: Dict[str, SymbolInfo] = {}
+        self.brains: Dict[str, Brain] = {}
+        self.open_risk: Dict[int, dict] = {}  # ticket -> sizing info, to express results in R
+        self.seen_closed: Deque[int] = deque(maxlen=5000)
+        self._seen_set: set = set()
+        self.last_sync: Optional[pd.Timestamp] = None
+        self.risk = RiskManager(cfg.risk, self._load_state())
+
+    # ------------------------------------------------------------------ setup
+    def add_symbol(self, symbol: str) -> SymbolInfo:
+        info = self.broker.symbol_info(symbol)
+        self.infos[symbol] = info
+        return info
+
+    def prepare(self, symbol: str, bars: pd.DataFrame) -> Prepared:
+        info = self.infos[symbol]
+        m, t = self.cfg.model, self.cfg.trading
+        fs = build_features(bars, info.point, m.atr_period)
+        extra_cost = m.slippage_points * info.point
+        if t.commission_per_lot > 0:
+            extra_cost += t.commission_per_lot / info.value_per_price_unit
+        labels = label_all(bars, fs.atr, self.arms, m.horizon_bars, info.point,
+                           self.cfg.backtest.default_spread_points, extra_cost)
+        return Prepared(bars, fs, labels, to_ns(bars["time"]))
+
+    def brain(self, symbol: str, feature_names) -> Brain:
+        if symbol in self.brains:
+            return self.brains[symbol]
+        brain = None
+        path = self._brain_path(symbol)
+        if path is not None and path.exists():
+            try:
+                loaded = Brain.load(path)
+                if loaded.compatible_with(feature_names, self.cfg.model):
+                    loaded.apply_config(self.cfg.model)
+                    brain = loaded
+                    log.info("%s: resumed saved model (%d samples learned)", symbol, loaded.n_learned)
+                else:
+                    log.warning("%s: saved model is incompatible with the current config - starting fresh", symbol)
+            except Exception as exc:  # corrupted file etc.
+                log.warning("%s: could not load saved model (%s) - starting fresh", symbol, exc)
+        if brain is None:
+            brain = Brain(symbol, feature_names, self.cfg.model, bar_minutes=self.cfg.timeframe_minutes)
+        self.brains[symbol] = brain
+        return brain
+
+    def learn(self, symbol: str, prep: Prepared, i: int) -> int:
+        """Learn all samples whose outcome is fully known at the close of bar ``i``."""
+        fs = prep.features
+        brain = self.brain(symbol, fs.names)
+        return brain.learn(fs.X, prep.times, fs.valid, prep.labels, i - self.cfg.model.horizon_bars)
+
+    def warmup(self, symbol: str, bars: pd.DataFrame) -> int:
+        prep = self.prepare(symbol, bars)
+        n = self.learn(symbol, prep, len(bars) - 1)
+        log.info("%s: warm-up learned %d new samples from %d bars of history", symbol, n, len(bars))
+        return n
+
+    # ------------------------------------------------------------------ main cycle
+    def on_bar(self, symbol: str, prep: Prepared, i: Optional[int] = None) -> Decision:
+        cfg = self.cfg
+        i = len(prep.bars) - 1 if i is None else i
+        info = self.infos[symbol]
+        fs = prep.features
+        bar_time = pd.Timestamp(int(prep.times[i]))
+        bar_close = bar_time + self.tf
+
+        # 1) learn
+        brain = self.brain(symbol, fs.names)
+        brain.learn(fs.X, prep.times, fs.valid, prep.labels, i - cfg.model.horizon_bars)
+
+        # 2) account
+        acct = self.broker.account()
+        self.risk.update_equity(acct.equity, bar_close)
+        self.sync_closed(bar_close)
+
+        # 3) manage
+        tick = self.broker.get_tick(symbol)
+        positions = self.broker.positions(symbol, cfg.trading.magic)
+        if positions:
+            self._manage(symbol, positions, prep, i, tick, bar_close)
+            positions = self.broker.positions(symbol, cfg.trading.magic)
+
+        # 4) decide
+        decision = brain.decide(fs.X, prep.times, fs.valid, i)
+
+        # 5) execute
+        if decision.arm is not None:
+            blocked = self._gate(symbol, decision, positions, tick, bar_close, acct.equity)
+            if blocked:
+                decision.reason = f"blocked: {blocked}"
+            else:
+                self._execute(symbol, info, decision, tick, acct.equity, fs.atr[i], bar_close)
+        self._journal_decision(symbol, bar_close, decision)
+        return decision
+
+    # ------------------------------------------------------------------ steps
+    def _bars_held(self, pos: Position, prep: Prepared, i: int) -> int:
+        open_ns = int(pd.Timestamp(pos.time_open).value)
+        open_bar = open_ns - (open_ns % self.tf_ns)
+        first = int(np.searchsorted(prep.times[: i + 1], open_bar, side="left"))
+        return i + 1 - first
+
+    def _friday_cutoff(self, when: pd.Timestamp) -> bool:
+        cut = self.cfg.trading.friday_cutoff_hour
+        return cut is not None and when.dayofweek == 4 and when.hour >= cut
+
+    def _manage(self, symbol, positions, prep: Prepared, i: int, tick: Tick, now: pd.Timestamp) -> None:
+        cfg = self.cfg
+        for pos in positions:
+            reason = None
+            if self._bars_held(pos, prep, i) >= cfg.model.horizon_bars:
+                reason = "time-exit"
+            elif self._friday_cutoff(now):
+                reason = "friday-close"
+            if reason:
+                if self.dry_run:
+                    continue
+                res = self.broker.close_position(pos, comment=f"ai:{reason}", deviation=cfg.trading.deviation_points)
+                self._event(now, symbol, reason, f"ticket {pos.ticket}: {'ok' if res.ok else res.message}")
+                continue
+            be = cfg.risk.breakeven_at_r
+            meta = self.open_risk.get(pos.ticket)
+            if be is not None and meta and not meta.get("breakeven"):
+                cur = tick.bid if pos.side is Side.BUY else tick.ask
+                gain_r = pos.side.value * (cur - pos.price_open) / meta["sl_dist"]
+                if gain_r >= be:
+                    new_sl = self.infos[symbol].round_price(pos.price_open)
+                    res = self.broker.modify_position(pos, new_sl, pos.tp)
+                    if res.ok:
+                        meta["breakeven"] = True
+                    self._event(now, symbol, "breakeven", f"ticket {pos.ticket}: {'ok' if res.ok else res.message}")
+
+    def _gate(self, symbol, decision: Decision, positions, tick: Tick, now: pd.Timestamp, equity: float) -> str:
+        cfg = self.cfg
+        ok, why = self.risk.can_trade(equity, now)
+        if not ok:
+            return why
+        s = cfg.trading.session
+        if not (s.start_hour <= now.hour < s.end_hour):
+            return "outside trading session"
+        if self._friday_cutoff(now):
+            return "friday cut-off"
+        if tick.time - now > self.tf * cfg.trading.stale_bar_tolerance:
+            return "market data is stale (market closed?)"
+        return ""
+
+    def _execute(self, symbol: str, info: SymbolInfo, decision: Decision, tick: Tick,
+                 equity: float, atr_i: float, now: pd.Timestamp) -> None:
+        cfg = self.cfg
+        arm = decision.arm
+        if arm.side is Side.BUY:
+            price = tick.ask
+            sl, tp = price - arm.sl_atr * atr_i, price + arm.tp_atr * atr_i
+        else:
+            price = tick.bid
+            sl, tp = price + arm.sl_atr * atr_i, price - arm.tp_atr * atr_i
+        sl, tp = info.round_price(sl), info.round_price(tp)
+        # size from the stop exactly as it will be placed (after rounding to the tick size)
+        sl_dist, tp_dist = abs(price - sl), abs(tp - price)
+        n_sym = len(self.broker.positions(symbol, cfg.trading.magic))
+        n_tot = len(self.broker.positions(None, cfg.trading.magic))
+        ok, why = self.risk.check_trade(info, tick.spread, sl_dist, tp_dist, n_sym, n_tot)
+        if ok:
+            lots, risk_money = self.risk.position_size(equity, info, sl_dist)
+            if lots <= 0:
+                ok, why = False, "minimum lot size would exceed the risk budget"
+        if not ok:
+            decision.reason = f"blocked: {why}"
+            return
+        row = {"time": now, "symbol": symbol, "side": arm.side.label, "volume": lots, "price": price,
+               "sl": sl, "tp": tp, "risk_money": round(risk_money, 2), "prob": round(decision.prob, 4),
+               "ev_r": round(decision.ev_r, 4), "arm": arm.key}
+        if self.dry_run:
+            log.info("%s DRY-RUN %s %.2f lots @ %s SL %s TP %s (p=%.2f, EV=%+.2fR)", symbol, arm.side.label,
+                     lots, price, sl, tp, decision.prob, decision.ev_r)
+            self.journal.write("orders", {**row, "status": "dry_run"})
+            decision.reason = "dry run"
+            return
+        comment = f"ai {arm.side.label[0]} p{decision.prob:.2f}"
+        res = self.broker.open_position(symbol, arm.side, lots, sl, tp, cfg.trading.magic, comment,
+                                        cfg.trading.deviation_points)
+        if res.ok:
+            if res.ticket is not None:
+                self.open_risk[int(res.ticket)] = {"symbol": symbol, "risk_money": risk_money,
+                                                   "sl_dist": sl_dist, "arm": arm.key}
+            log.info("%s OPEN %s %.2f lots @ %s SL %s TP %s (p=%.2f, EV=%+.2fR, risk %.2f)", symbol,
+                     arm.side.label, lots, res.price, sl, tp, decision.prob, decision.ev_r, risk_money)
+            decision.reason = "opened"
+        else:
+            log.warning("%s order rejected: %s", symbol, res.message)
+            decision.reason = f"order rejected: {res.message}"
+        self.journal.write("orders", {**row, "price": res.price or price, "ticket": res.ticket,
+                                      "status": "filled" if res.ok else "rejected", "message": res.message})
+
+    def sync_closed(self, now: pd.Timestamp) -> None:
+        since = (self.last_sync or now - pd.Timedelta(days=1)) - pd.Timedelta(hours=1)
+        trades = self.broker.closed_trades(since, self.cfg.trading.magic, list(self.open_risk))
+        for t in sorted(trades, key=lambda x: x.time_close):
+            if t.position_id in self._seen_set:
+                continue
+            if len(self.seen_closed) == self.seen_closed.maxlen:
+                self._seen_set.discard(self.seen_closed[0])
+            self.seen_closed.append(t.position_id)
+            self._seen_set.add(t.position_id)
+            meta = self.open_risk.pop(t.position_id, None)
+            if meta and meta.get("risk_money", 0) > 0:
+                r = t.profit / meta["risk_money"]
+            else:
+                approx = max(1e-9, self.risk.state.peak_equity or 1.0) * self.cfg.risk.risk_per_trade_pct / 100
+                r = t.profit / approx
+            self.risk.record_trade(r, t.time_close)
+            if meta and meta.get("arm") and meta.get("symbol") in self.brains:
+                self.brains[meta["symbol"]].record_real_trade(meta["arm"], r)
+            self.journal.write("closed", {"time": t.time_close, "symbol": t.symbol, "ticket": t.position_id,
+                                          "side": t.side.label if t.side else "", "volume": t.volume,
+                                          "price_close": t.price_close, "profit": round(t.profit, 2),
+                                          "r_multiple": round(r, 3), "reason": t.reason})
+            log.info("%s CLOSED ticket %s: %+.2f (%+.2fR, %s)", t.symbol, t.position_id, t.profit, r, t.reason)
+        self.last_sync = now
+
+    # ------------------------------------------------------------------ journal / state
+    def _journal_decision(self, symbol: str, now: pd.Timestamp, d: Decision) -> None:
+        if not self.journal.log_decisions or self.journal.dir is None:
+            return
+        buy = [e.prob for e in d.evals if e.arm.side is Side.BUY]
+        sell = [e.prob for e in d.evals if e.arm.side is Side.SELL]
+        self.journal.write("decisions", {
+            "time": now, "symbol": symbol, "action": d.action, "arm": d.arm.key if d.arm else "",
+            "prob": round(d.prob, 4), "ev_r": round(d.ev_r, 4), "reason": d.reason,
+            "best_buy_p": round(max(buy), 4) if buy else "", "best_sell_p": round(max(sell), 4) if sell else "",
+        })
+
+    def _event(self, now, symbol, event, detail) -> None:
+        log.info("%s %s: %s", symbol, event, detail)
+        self.journal.write("events", {"time": now, "symbol": symbol, "event": event, "detail": detail})
+
+    def _brain_path(self, symbol: str) -> Optional[Path]:
+        if self.state_dir is None:
+            return None
+        safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in symbol)
+        return self.state_dir / f"brain_{safe}_{self.cfg.trading.timeframe}.joblib"
+
+    def _state_path(self) -> Optional[Path]:
+        return None if self.state_dir is None else self.state_dir / "bot_state.json"
+
+    def _load_state(self) -> Optional[RiskState]:
+        path = self._state_path()
+        if path is None or not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning("Could not read %s (%s); starting with a clean risk state", path, exc)
+            return None
+        self.open_risk = {int(k): v for k, v in data.get("open_risk", {}).items()}
+        for pid in data.get("seen_closed", []):
+            self.seen_closed.append(int(pid))
+            self._seen_set.add(int(pid))
+        if data.get("last_sync"):
+            self.last_sync = pd.Timestamp(data["last_sync"])
+        return RiskState.from_dict(data.get("risk", {}))
+
+    def save_state(self, models: bool = True) -> None:
+        """Persist the risk state (small) and, if ``models``, the learned models (larger)."""
+        if self.state_dir is None:
+            return
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        if models:
+            for symbol, brain in self.brains.items():
+                brain.save(self._brain_path(symbol))
+        data = {
+            "risk": self.risk.state.to_dict(),
+            "open_risk": {str(k): v for k, v in self.open_risk.items()},
+            "seen_closed": list(self.seen_closed)[-1000:],
+            "last_sync": self.last_sync.isoformat() if self.last_sync is not None else None,
+        }
+        path = self._state_path()
+        fd, tmp = tempfile.mkstemp(dir=str(self.state_dir), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, default=str)
+        os.replace(tmp, path)

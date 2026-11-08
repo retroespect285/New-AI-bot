@@ -1,0 +1,9 @@
+numpy>=1.23
+pandas>=1.5
+scikit-learn>=1.2
+threadpoolctl>=3.1
+joblib>=1.2
+PyYAML>=6.0
+MetaTrader5>=5.0.45; sys_platform == "win32"
+# optional: equity-curve PNG in backtests
+matplotlib>=3.6

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+# secrets and per-machine config
+.env
+config.yaml
+# runtime output
+state/
+logs/
+backtests/
+data/*.csv
+data/*.json
