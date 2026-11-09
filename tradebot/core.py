@@ -190,7 +190,8 @@ class BotCore:
             if blocked:
                 decision.reason = f"blocked: {blocked}"
             else:
-                self._execute(symbol, info, decision, tick, acct, fs.atr_tf[decision.arm.tf][i], bar_close)
+                atr_now = {tf: float(a[i]) for tf, a in fs.atr_tf.items()}
+                self._execute(symbol, info, decision, tick, acct, atr_now, bar_close)
         self._journal_decision(symbol, bar_close, decision)
         return decision
 
@@ -328,11 +329,12 @@ class BotCore:
             return f"news blackout ({news})"
         return ""
 
-    def _execute(self, symbol: str, info: SymbolInfo, decision: Decision, tick: Tick,
-                 acct: AccountInfo, atr_i: float, now: pd.Timestamp) -> None:
+    def _plan(self, symbol: str, info: SymbolInfo, arm, tick: Tick, acct: AccountInfo, atr_i: float):
+        """Prices, size and checks for opening ``arm`` now. Returns (ok, why, details)."""
         cfg = self.cfg
-        arm = decision.arm
         equity = acct.equity
+        if not np.isfinite(atr_i) or atr_i <= 0:
+            return False, "volatility (ATR) not known yet", {}
         if arm.side is Side.BUY:
             price = tick.ask
             sl, tp = price - arm.sl_atr * atr_i, price + arm.tp_atr * atr_i
@@ -358,8 +360,34 @@ class BotCore:
             if margin is not None and margin > acct.margin_free * 0.9:
                 ok, why = False, f"not enough free margin (needs {margin:.2f}, free {acct.margin_free:.2f})"
         if not ok:
-            decision.reason = f"blocked: {why}"
+            return False, why, {}
+        return True, "", dict(price=price, sl=sl, tp=tp, sl_dist=sl_dist, lots=lots, risk_money=risk_money)
+
+    def _execute(self, symbol: str, info: SymbolInfo, decision: Decision, tick: Tick,
+                 acct: AccountInfo, atr_now: Dict[str, float], now: pd.Timestamp) -> None:
+        cfg = self.cfg
+        # The best setup first; if the account can't take it (too big for the risk limit, margin),
+        # the next-best setup that also passed every gate and does fit.
+        others = sorted((e for e in decision.evals if e.eligible and e.arm != decision.arm),
+                        key=lambda e: e.ev_r, reverse=True)
+        candidates = [(decision.arm, decision.prob, decision.ev_r)] + [(e.arm, e.p_tp, e.ev_r) for e in others]
+        first_why = None
+        for arm, prob, ev in candidates:
+            ok, why, plan = self._plan(symbol, info, arm, tick, acct, atr_now.get(arm.tf, float("nan")))
+            if ok:
+                break
+            first_why = first_why or why
+        else:
+            extra = " (no other qualifying setup fits either)" if others else ""
+            decision.reason = f"blocked: {first_why}{extra}"
             return
+        if arm != decision.arm:
+            log.info("%s best setup %s does not fit (%s); taking %s instead", symbol, decision.arm.key,
+                     first_why, arm.key)
+            decision.arm, decision.prob, decision.ev_r = arm, prob, ev
+        price, sl, tp, sl_dist = plan["price"], plan["sl"], plan["tp"], plan["sl_dist"]
+        lots, risk_money = plan["lots"], plan["risk_money"]
+        atr_i = atr_now[arm.tf]
         row = {"time": now, "account": self.account_login, "symbol": symbol, "side": arm.side.label,
                "volume": lots, "price": price, "sl": sl, "tp": tp, "risk_money": round(risk_money, 2),
                "prob": round(decision.prob, 4), "ev_r": round(decision.ev_r, 4), "arm": arm.key,

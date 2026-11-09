@@ -131,3 +131,30 @@ def test_twenty_dollars_trades_the_minimum_lot_in_small_account_mode(monkeypatch
     (pos,) = sim.positions()
     assert pos.volume == 0.01
     assert core.open_risk[pos.ticket]["risk_money"] <= 20.0 * 0.5
+
+
+def test_takes_the_next_best_setup_that_fits_the_limit(monkeypatch):
+    from tradebot.brain import ArmEval
+
+    cfg = small_config()  # styles: M5 sl1/tp1.5 and M5 sl1.5/tp3
+    cfg.risk.max_spread_sl_fraction = 1.0
+    bars = synthetic_bars(900, seed=11)
+    sim = SimBroker({"EURUSD": bars}, {"EURUSD": EURUSD}, initial_balance=20.0)
+    core = BotCore(cfg, sim)
+    core.add_symbol("EURUSD")
+    prep = core.prepare("EURUSD", bars)
+    i = 700
+    atr = prep.features.atr_tf["M5"][i]
+    small_pct = 100 * 1.0 * atr * EURUSD.value_per_price_unit * 0.01 / 20.0
+    cfg.risk.min_lot_max_risk_pct = small_pct * 1.25  # the 1-ATR stop fits, the 1.5-ATR stop doesn't
+    buy_small, _, buy_big, _ = make_arms(cfg.model.styles)
+    evals = [ArmEval(buy_big, 0.4, 0.3, 0.30, 0.02, True, True, 30, 0.2, True),
+             ArmEval(buy_small, 0.45, 0.4, 0.15, 0.02, True, True, 30, 0.2, True)]
+    brain = core.brain("EURUSD", prep.features.names)
+    monkeypatch.setattr(brain, "decide", lambda *a, **k: Decision(buy_big, prob=0.4, ev_r=0.30, reason="signal",
+                                                                  evals=evals))
+    sim.set_index("EURUSD", i)
+    d = core.on_bar("EURUSD", prep, i)
+    assert d.reason == "opened" and d.arm == buy_small and d.ev_r == 0.15
+    (pos,) = sim.positions()
+    assert pos.volume == 0.01 and core.open_risk[pos.ticket]["arm"] == buy_small.key
