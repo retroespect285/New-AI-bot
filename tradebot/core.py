@@ -5,10 +5,11 @@ Each time a bar closes (every 5 minutes on M5) ``BotCore.on_bar`` does:
 1. **learn**    - every trade setup / direction forecast whose outcome is now known becomes a
                   training sample (the brain keeps learning from the market, not only its own trades);
 2. **account**  - update equity, daily-loss / drawdown limits and learn from the bot's closed trades;
-3. **manage**   - close positions that reached their style's max holding time or the Friday
-                  cut-off, optional break-even stop;
-4. **decide**   - read all charts (M1/M5/M30/H1/H4), score every setup (BUY/SELL x trade style),
+3. **decide**   - read all charts (M1/M5/M30/H1/H4), score every setup (BUY/SELL x trade style),
                   pick the best positive-EV one, and update the per-timeframe outlook;
+4. **manage**   - for open trades: move trailing stops behind the price, close when the brain is
+                  confident the market turned against the trade, at the style's max holding
+                  time or the Friday cut-off;
 5. **execute**  - risk checks, position sizing from the stop distance, send the order with SL/TP.
 """
 from __future__ import annotations
@@ -31,7 +32,7 @@ from .brokers.base import Broker
 from .config import TIMEFRAME_MINUTES, BotConfig
 from .features import FeatureSet, build_mtf_features
 from .journal import Journal
-from .labels import ArmLabels, direction_labels, label_all, make_arms
+from .labels import ArmLabels, direction_labels, label_all, make_arms, spread_prices
 from .news import NewsCalendar
 from .risk import RiskManager, RiskState
 from .types import AccountInfo, Position, Side, SymbolInfo, Tick
@@ -174,15 +175,14 @@ class BotCore:
         self.risk.update_equity(acct.equity, bar_close)
         self.sync_closed(bar_close)
 
-        # 3) manage
+        # 3) decide
         tick = self.broker.get_tick(symbol)
+        decision = brain.decide(fs.X, prep.times, fs.valid, i)
+
+        # 4) manage open trades (trailing stop, reversal, time limits)
         positions = self.broker.positions(symbol, cfg.trading.magic)
         if positions:
-            self._manage(symbol, positions, prep, i, tick, bar_close)
-            positions = self.broker.positions(symbol, cfg.trading.magic)
-
-        # 4) decide
-        decision = brain.decide(fs.X, prep.times, fs.valid, i)
+            self._manage(symbol, positions, prep, i, tick, bar_close, decision)
 
         # 5) execute
         if decision.arm is not None:
@@ -226,31 +226,90 @@ class BotCore:
         cut = self.cfg.trading.friday_cutoff_hour
         return cut is not None and when.dayofweek == 4 and when.hour >= cut
 
-    def _manage(self, symbol, positions, prep: Prepared, i: int, tick: Tick, now: pd.Timestamp) -> None:
+    def _manage(self, symbol, positions, prep: Prepared, i: int, tick: Tick, now: pd.Timestamp,
+                decision: Optional[Decision] = None) -> None:
         cfg = self.cfg
+        info = self.infos[symbol]
         for pos in positions:
+            meta = self.open_risk.get(pos.ticket) or {}
             reason = None
             if self._bars_held(pos, prep, i) >= self._max_hold(pos):
                 reason = "time-exit"
             elif self._friday_cutoff(now):
                 reason = "friday-close"
+            elif cfg.risk.exit_on_reversal and decision is not None and any(
+                    e.eligible and e.arm.side is not pos.side for e in decision.evals):
+                reason = "reversal"  # the brain is now confident the market goes the other way
             if reason:
-                if self.dry_run:
-                    continue
-                res = self.broker.close_position(pos, comment=f"ai:{reason}", deviation=cfg.trading.deviation_points)
-                self._event(now, symbol, reason, f"ticket {pos.ticket}: {'ok' if res.ok else res.message}")
+                self._close(symbol, pos, reason, now)
                 continue
+            # dynamic stop: the most protective of the current stop, the trailing level and break-even
+            levels = []
+            trail = self._trail_level(pos, meta, prep, i, info)
+            if trail is not None:
+                levels.append((trail, "trail"))
             be = cfg.risk.breakeven_at_r
-            meta = self.open_risk.get(pos.ticket)
-            if be is not None and meta and not meta.get("breakeven"):
+            if be is not None and meta.get("sl_dist"):
                 cur = tick.bid if pos.side is Side.BUY else tick.ask
-                gain_r = pos.side.value * (cur - pos.price_open) / meta["sl_dist"]
-                if gain_r >= be:
-                    new_sl = self.infos[symbol].round_price(pos.price_open)
-                    res = self.broker.modify_position(pos, new_sl, pos.tp)
-                    if res.ok:
-                        meta["breakeven"] = True
-                    self._event(now, symbol, "breakeven", f"ticket {pos.ticket}: {'ok' if res.ok else res.message}")
+                if pos.side.value * (cur - pos.price_open) / meta["sl_dist"] >= be:
+                    levels.append((pos.price_open, "breakeven"))
+            if levels:
+                pick = max if pos.side is Side.BUY else min
+                level, why = pick(levels, key=lambda lv: lv[0])
+                self._move_stop(symbol, pos, level, why, tick, info, now)
+
+    def _close(self, symbol: str, pos: Position, reason: str, now: pd.Timestamp) -> None:
+        if self.dry_run:
+            log.info("%s DRY-RUN would close ticket %s (%s)", symbol, pos.ticket, reason)
+            return
+        res = self.broker.close_position(pos, comment=f"ai:{reason}", deviation=self.cfg.trading.deviation_points)
+        self._event(now, symbol, reason, f"ticket {pos.ticket}: {'closed' if res.ok else res.message}")
+
+    def _trail_level(self, pos: Position, meta: dict, prep: Prepared, i: int, info: SymbolInfo) -> Optional[float]:
+        """Where a trailing stop should be after the last closed candle (None if not trailing yet).
+        Mirrors the learning simulation in ``labels._label_trailing``."""
+        arm = self.arm_by_key.get(meta.get("arm", ""))
+        if arm is None or not arm.trail_atr or "trail_dist" not in meta:
+            return None
+        first = i + 1 - self._bars_held(pos, prep, i)
+        if first > i:
+            return None
+        bars = prep.bars.iloc[first: i + 1]
+        if pos.side is Side.BUY:
+            best = float(bars["high"].max())
+            if best - pos.price_open >= meta["start_dist"]:
+                return best - meta["trail_dist"]
+        else:
+            spr = spread_prices(bars, info.point, self.cfg.backtest.default_spread_points)
+            best = float((bars["low"].to_numpy(dtype=float) + spr).min())  # shorts are closed at the ask
+            if pos.price_open - best >= meta["start_dist"]:
+                return best + meta["trail_dist"]
+        return None
+
+    def _move_stop(self, symbol: str, pos: Position, level: float, why: str, tick: Tick,
+                   info: SymbolInfo, now: pd.Timestamp) -> None:
+        """Move the stop-loss on the broker's server - only ever in the trade's favour, and within
+        the broker's minimum distance (stops level) and freeze rules."""
+        new_sl = info.round_price(level)
+        buy = pos.side is Side.BUY
+        half_tick = info.tick_size / 2
+        if pos.sl > 0 and ((buy and new_sl <= pos.sl + half_tick) or (not buy and new_sl >= pos.sl - half_tick)):
+            return  # not an improvement
+        cur = tick.bid if buy else tick.ask
+        freeze = info.freeze_level * info.point
+        if freeze > 0 and ((pos.sl > 0 and abs(cur - pos.sl) <= freeze) or (pos.tp > 0 and abs(pos.tp - cur) <= freeze)):
+            return  # the broker does not allow changes this close to a level; retry next candle
+        gap = (info.stops_level + 1) * info.point
+        if (buy and new_sl > cur - gap) or (not buy and new_sl < cur + gap):
+            # price has already come back through the new stop level: do what the stop would do
+            self._close(symbol, pos, f"{why}-stop", now)
+            return
+        if self.dry_run:
+            log.info("%s DRY-RUN would move SL of %s to %s (%s)", symbol, pos.ticket, new_sl, why)
+            return
+        res = self.broker.modify_position(pos, new_sl, pos.tp)
+        self._event(now, symbol, why, f"ticket {pos.ticket}: SL {pos.sl} -> {new_sl}"
+                    + ("" if res.ok else f" failed: {res.message}"))
 
     def _gate(self, tick: Tick, now: pd.Timestamp, equity: float) -> str:
         cfg = self.cfg
@@ -307,8 +366,11 @@ class BotCore:
                                         cfg.trading.deviation_points)
         if res.ok:
             if res.ticket is not None:
-                self.open_risk[int(res.ticket)] = {"symbol": symbol, "risk_money": risk_money,
-                                                   "sl_dist": sl_dist, "arm": arm.key}
+                meta = {"symbol": symbol, "risk_money": risk_money, "sl_dist": sl_dist, "arm": arm.key}
+                if arm.trail_atr:
+                    meta["trail_dist"] = arm.trail_atr * atr_i
+                    meta["start_dist"] = arm.trail_start_r * sl_dist
+                self.open_risk[int(res.ticket)] = meta
             log.info("%s OPEN %s %.2f lots @ %s SL %s TP %s [%s, hold <= %d bars] (p=%.2f, EV=%+.2fR, risk %.2f)",
                      symbol, arm.side.label, lots, res.price, sl, tp, arm.key, arm.horizon, decision.prob,
                      decision.ev_r, risk_money)

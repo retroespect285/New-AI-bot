@@ -42,10 +42,15 @@ model:
   outlooks: [M5, M30, H1, H4]
   # Trade styles the bot chooses from (each as BUY or SELL). Stop-loss / take-profit are multiples of
   # the ATR of the style's chart; max_hold_bars is in M5 candles (12 = 1 hour).
+  # trail_atr: the stop follows the price - once the trade is trail_start_r R in profit, after every
+  # candle the stop moves to trail_atr ATR behind the best price so far (never backwards).
+  # The brain learns what each style is worth and picks the best one for the current chart.
   styles:
     - {timeframe: M5,  sl_atr: 1.5, tp_atr: 2.0, max_hold_bars: 12}    # scalp, up to 1 hour
     - {timeframe: M30, sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 48}    # intraday, up to 4 hours
     - {timeframe: H1,  sl_atr: 1.0, tp_atr: 2.0, max_hold_bars: 96}    # intraday swing, up to 8 hours
+    - {timeframe: M30, sl_atr: 1.0, tp_atr: 3.0, max_hold_bars: 48, trail_atr: 1.0, trail_start_r: 1.0}
+    - {timeframe: H1,  sl_atr: 1.0, tp_atr: 3.0, max_hold_bars: 96, trail_atr: 1.0, trail_start_r: 1.0}
     # Optional: trades sized on the H4 chart, held up to 24 hours. Its results arrive a day late and
     # overlap heavily, so it learns poorly (tested); H4 is read for every decision either way.
     # - {timeframe: H4, sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 288}
@@ -94,6 +99,7 @@ risk:
   min_risk_multiplier: 0.25
   max_lots: 5.0
   breakeven_at_r: null       # e.g. 1.0 = move the stop to entry once the trade is +1R
+  exit_on_reversal: true     # close a trade when the brain becomes confident the market turned
 
 readiness:                   # what `python -m tradebot readiness` requires before saying "go live"
   min_days: 14

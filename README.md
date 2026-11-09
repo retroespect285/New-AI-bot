@@ -24,9 +24,9 @@ that grows every 5 minutes and is reloaded after every restart.
  1. READ     M1 + M5 + M30 + H1 + H4 charts → ~150 indicators and candle patterns
  2. LEARN    every forecast whose answer is now known is scored and learned from (brain file grows)
  3. ACCOUNT  equity, daily-loss / drawdown limits, results of the bot's own closed trades
- 4. MANAGE   close positions that reached their max holding time or the Friday cut-off
- 5. FORECAST direction outlook for 5 min / 30 min / 1 h / 4 h
- 6. DECIDE   score 6 setups: BUY/SELL × 3 trade styles (M5 scalp, M30 intraday, H1 swing) → expected value
+ 4. FORECAST direction outlook for 5 min / 30 min / 1 h / 4 h
+ 5. DECIDE   score 10 setups: BUY/SELL × 5 trade styles (fixed or trailing stop) → expected value
+ 6. MANAGE   open trade: move the stop behind the price, exit if the forecast turns, time limits
  7. EXECUTE  risk checks → lot size from stop distance → market order with SL and TP attached
 ```
 
@@ -51,7 +51,7 @@ which gives a running accuracy per timeframe: the brain's report card. You see i
 (`outlook M5:UP52% M30:DN51% H1:UP55% H4:UP57%`: direction and confidence), in
 `logs/decisions.csv`, and in `status`.
 
-**Trade styles.** The bot chooses between three ways of trading, each sized by the ATR of its own
+**Trade styles.** The bot chooses between five ways of trading, each sized by the ATR of its own
 chart (all configurable):
 
 | style | stop-loss | take-profit | max hold | example stop (varies with volatility) |
@@ -59,6 +59,8 @@ chart (all configurable):
 | M5 scalp | 1.5 × ATR(M5) | 2.0 × ATR(M5) | 1 hour | $3–5 stop |
 | M30 intraday | 1.0 × ATR(M30) | 1.5 × ATR(M30) | 4 hours | $5–8 stop |
 | H1 intraday swing | 1.0 × ATR(H1) | 2.0 × ATR(H1) | 8 hours | $8–12 stop |
+| M30 trailing | 1.0 × ATR(M30), then **trails** 1 ATR behind price | 3.0 × ATR(M30) | 4 hours | $5–8 stop |
+| H1 trailing | 1.0 × ATR(H1), then **trails** 1 ATR behind price | 3.0 × ATR(H1) | 8 hours | $8–12 stop |
 | *H4 day trade (optional, off)* | *1.0 × ATR(H4)* | *1.5 × ATR(H4)* | *24 hours* | *$15–25 stop* |
 
 The H4 chart is read for every decision and gets its own 4-hour forecast. Trades *sized* on H4 are
@@ -66,7 +68,7 @@ off by default because tests showed they learn poorly: each one takes up to a da
 feedback arrives late and consecutive samples are nearly duplicates. You can switch it on in
 `config.yaml`.
 
-Each style can be a BUY or a SELL, which gives 6 setups. For each setup the brain estimates
+Each style can be a BUY or a SELL, which gives 10 setups. For each setup the brain estimates
 `P(take-profit first)` and `P(stop-loss first)`, then the **expected value** in R (1R = the money
 risked): `EV = P(TP)·avgWin + P(SL)·avgLoss + P(timeout)·avgTimeout`, with spread and costs included.
 It takes the best setup only if all of these hold:
@@ -78,6 +80,35 @@ It takes the best setup only if all of these hold:
 
 M1 is used for *reading* only. Trades sized on 1-minute candles would have stops of ~$1, where a
 $0.25–0.40 gold spread eats a third of every trade.
+
+### Stop-loss and take-profit that follow the price
+The bot sets its own stop-loss and take-profit when it opens a trade, sized to the current
+volatility of the chosen style's chart. While the trade is open it keeps managing them by itself;
+after every 5-minute candle it:
+
+* **trails the stop** (trailing styles): once the trade is +1R in profit, the stop moves to 1 ATR
+  behind the best price reached, locking in profit. It only moves in the trade's favour, never back;
+* optionally moves the stop to **break-even** (`risk.breakeven_at_r`);
+* **closes early when the forecast turns**: if the brain becomes confident the market will go the
+  other way (an opposite setup passes every gate), it closes the trade and may take the opposite one
+  (`risk.exit_on_reversal`);
+* closes at the style's **max holding time** and before the weekend.
+
+**The brain learns what each exit method is worth.** When it studies history, every trailing
+setup is replayed candle by candle with the stop moved exactly as the live bot moves it. So the
+brain knows, for the current chart, whether a fixed target or a trailing stop has the better
+expected result, and picks accordingly. A test trades 40 trailing positions through the real
+cycle and checks that each result matches what the learning predicted.
+
+The stops are moved **on the broker's server** (MT5 "modify position"), so they protect the trade
+between candles and even if your PC goes offline. Broker rules are respected: a new stop must keep
+the broker's minimum distance from price, and nothing is changed inside the broker's freeze zone. If
+price has already come back through the new stop level, the bot closes the trade at market, which is
+what the stop would have done.
+
+Why every 5 minutes and not every tick? Updating once per closed candle is what the brain can
+learn from and replay exactly. Tick-by-tick trailing would make live behaviour differ from
+everything it learned. Between candles, the stop already sits on the server and triggers instantly.
 
 ### 3. The brain: how it gets smarter
 `tradebot/learner.py`, `tradebot/brain.py`. Each setup and each outlook has its own learner that
@@ -94,7 +125,7 @@ current market best gets the most say. When a pattern stops working, its weight 
 score drops and the paper record turns negative, and the bot stops trading that setup until it
 works again.
 
-**It learns from every candle, not just its own trades.** Every 5 minutes, all 6 setups and 4
+**It learns from every candle, not just its own trades.** Every 5 minutes, all 10 setups and 4
 outlooks whose outcome has become known are scored and learned. That's thousands of lessons per
 day, demo or live.
 
@@ -187,7 +218,7 @@ that everything works.
 | `logs/decisions.csv` | every 5 minutes: action, setup, probability, EV, reason, `up_M5`…`up_H4` outlook |
 | `logs/orders.csv` | every order sent (or `dry_run`) with SL/TP, lots, money at risk, setup, account |
 | `logs/closed.csv` | every closed trade: profit, result in R, setup, account |
-| `logs/events.csv` | time exits, Friday closes, break-even moves |
+| `logs/events.csv` | every stop moved (trail / break-even), reversal exits, time exits, Friday closes |
 
 ### News blackout (recommended for gold)
 Create e.g. `data\news.csv` with times in your **broker's server time**, and set
@@ -287,7 +318,8 @@ None of this predicts results on real gold. Only your broker's data and weeks of
 | `trading.timeframe` | `M5` | decides once per closed 5-minute candle |
 | `model.context_timeframes` | `[M1, M30, H1, H4]` | other charts it reads |
 | `model.outlooks` | `[M5, M30, H1, H4]` | direction forecasts it makes and scores |
-| `model.styles` | 4 styles (table above) | stop / target / hold choices |
+| `model.styles` | 5 styles (table above) | stop / target / hold / trailing choices |
+| `risk.exit_on_reversal` | `true` | close a trade when the brain turns confidently against it |
 | `model.min_ev_r` | `0.10` | minimum expected value per trade after costs |
 | `risk.risk_per_trade_pct` | `0.5` | % of equity lost when a stop is hit |
 | `risk.max_daily_loss_pct` | `3` | daily circuit breaker |

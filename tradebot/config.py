@@ -67,16 +67,24 @@ class TradingConfig:
 @dataclass
 class TradeStyle:
     """One way of trading the chart: stop-loss / take-profit measured in the ATR of ``timeframe``
-    and a maximum holding time in trading-timeframe bars."""
+    and a maximum holding time in trading-timeframe bars.
+
+    With ``trail_atr`` set, the stop-loss *trails* the price: once the trade is ``trail_start_r``
+    R in profit, after every candle the stop is moved to ``trail_atr`` ATR behind the best price
+    reached (never backwards). The learning simulates exactly this, so the brain knows what a
+    trailing exit is worth and chooses between fixed and trailing styles itself."""
 
     timeframe: str = "M5"
     sl_atr: float = 1.0
     tp_atr: float = 1.5
     max_hold_bars: int = 24
+    trail_atr: Optional[float] = None
+    trail_start_r: float = 1.0
 
     @property
     def name(self) -> str:
-        return f"{self.timeframe}:sl{self.sl_atr:g}_tp{self.tp_atr:g}"
+        trail = f"_tr{self.trail_atr:g}" if self.trail_atr else ""
+        return f"{self.timeframe}:sl{self.sl_atr:g}_tp{self.tp_atr:g}{trail}"
 
 
 def _gold_styles() -> List[TradeStyle]:
@@ -87,6 +95,9 @@ def _gold_styles() -> List[TradeStyle]:
         TradeStyle("M5", 1.5, 2.0, 12),    # scalp: up to 1 hour
         TradeStyle("M30", 1.0, 1.5, 48),   # intraday: up to 4 hours
         TradeStyle("H1", 1.0, 2.0, 96),    # intraday swing: up to 8 hours
+        # trailing variants: the stop follows the price once the trade is +1R, target further away
+        TradeStyle("M30", 1.0, 3.0, 48, trail_atr=1.0, trail_start_r=1.0),
+        TradeStyle("H1", 1.0, 3.0, 96, trail_atr=1.0, trail_start_r=1.0),
     ]
 
 
@@ -153,6 +164,9 @@ class RiskConfig:
     min_risk_multiplier: float = 0.25
     max_lots: float = 5.0
     breakeven_at_r: Optional[float] = None  # e.g. 1.0 => move SL to entry after +1R
+    # Close an open trade when the brain becomes confident the market will go the other way
+    # (an opposite setup passes every gate). The opposite trade may then be opened.
+    exit_on_reversal: bool = True
 
 
 @dataclass
@@ -223,6 +237,8 @@ class BotConfig:
                 raise ConfigError(f"style timeframe {s.timeframe} must be {base} or one of model.context_timeframes")
             if s.sl_atr <= 0 or s.tp_atr <= 0 or s.max_hold_bars < 1:
                 raise ConfigError("style sl_atr / tp_atr must be > 0 and max_hold_bars >= 1")
+            if s.trail_atr is not None and (s.trail_atr <= 0 or s.trail_start_r < 0):
+                raise ConfigError("style trail_atr must be > 0 and trail_start_r >= 0")
         if len({s.name for s in m.styles}) != len(m.styles):
             raise ConfigError("model.styles has duplicates")
         for tf in m.outlooks:
