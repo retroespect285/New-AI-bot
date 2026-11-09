@@ -1,11 +1,12 @@
 """Command line: ``python -m tradebot <command>``.
 
 Commands
-  check     connect to MT5 and print account + symbol details (no trading)
-  live      run the bot on MT5 (use a DEMO account first; --dry-run sends no orders)
-  backtest  walk-forward backtest on a CSV export or synthetic data
-  export    download bar history from MT5 to CSV (for backtesting)
-  status    print what the saved models have learned so far
+  check      connect to MT5 and print account + symbol details (no trading)
+  live       run the bot on MT5 (use a DEMO account first; --dry-run sends no orders)
+  backtest   walk-forward backtest on exported CSVs (all timeframes) or synthetic data
+  export     download history of every chart the bot reads (M1, M5, M30, H1, H4) to CSV
+  status     what the brain has learned, and whether it is getting smarter day by day
+  readiness  does the demo record justify trading real money?
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ DEFAULT_SYMBOL_INFO = {
     "AUDUSD": dict(point=1e-5, digits=5, tick_size=1e-5, tick_value=1.0, contract_size=100000),
     "USDJPY": dict(point=1e-3, digits=3, tick_size=1e-3, tick_value=0.67, contract_size=100000),
     "XAUUSD": dict(point=0.01, digits=2, tick_size=0.01, tick_value=1.0, contract_size=100),
+    "GOLD": dict(point=0.01, digits=2, tick_size=0.01, tick_value=1.0, contract_size=100),
 }
 
 
@@ -54,11 +56,13 @@ def _symbol_info(cfg: BotConfig, symbol: str, csv_path: str = None) -> SymbolInf
         info = load_symbol_info(csv_path)
         if info is not None:
             return info
-    spec = dict(cfg.backtest.symbol_info.get(symbol) or DEFAULT_SYMBOL_INFO.get(symbol.upper()) or {})
+    base_name = symbol.upper().split(".")[0].replace("-SIM", "").rstrip("M") if symbol else ""
+    spec = dict(cfg.backtest.symbol_info.get(symbol) or DEFAULT_SYMBOL_INFO.get(symbol.upper())
+                or DEFAULT_SYMBOL_INFO.get(base_name) or {})
     if not spec:
-        log.warning("No contract spec for %s - assuming a 5-digit FX pair. Add it under backtest.symbol_info "
-                    "or use `export` to save the broker's spec.", symbol)
-        spec = dict(DEFAULT_SYMBOL_INFO["EURUSD"])
+        log.warning("No contract spec for %s - assuming gold (XAUUSD, 100 oz per lot). Add it under "
+                    "backtest.symbol_info or use `export` to save the broker's spec.", symbol)
+        spec = dict(DEFAULT_SYMBOL_INFO["XAUUSD"])
     spec.setdefault("tick_size", spec.get("point"))
     return SymbolInfo(name=symbol, **spec)
 
@@ -75,10 +79,14 @@ def cmd_check(cfg: BotConfig, args) -> int:
         for symbol in cfg.trading.symbols:
             info = broker.symbol_info(symbol)
             tick = broker.get_tick(symbol)
-            bars = broker.get_rates(symbol, cfg.trading.timeframe, cfg.trading.warmup_bars)
-            print(f"{symbol}: bid {tick.bid} ask {tick.ask} spread {tick.spread / info.point:.0f}pts | "
-                  f"{len(bars)} closed {cfg.trading.timeframe} bars available "
-                  f"({bars['time'].iat[0]} -> {bars['time'].iat[-1]}) | spec {info.to_dict()}")
+            print(f"{symbol}: bid {tick.bid} ask {tick.ask} spread {tick.spread / info.point:.0f} points | "
+                  f"spec {info.to_dict()}")
+            for tf in [cfg.trading.timeframe] + cfg.model.context_timeframes:
+                want = (cfg.trading.warmup_bars if tf == cfg.trading.timeframe
+                        else cfg.context_fetch_bars(tf, cfg.trading.warmup_bars))
+                bars = broker.get_rates(symbol, tf, want)
+                print(f"  {tf:>4}: {len(bars):6d} of {want} wanted closed bars "
+                      f"({bars['time'].iat[0]} -> {bars['time'].iat[-1]})")
         positions = broker.positions(magic=cfg.trading.magic)
         print(f"Open positions of this bot (magic {cfg.trading.magic}): {len(positions)}")
     finally:
@@ -99,15 +107,19 @@ def cmd_export(cfg: BotConfig, args) -> int:
     from .brokers.mt5 import MT5Broker
     from .data import save_bars
 
+    from .config import TIMEFRAME_MINUTES
+
     broker = MT5Broker(cfg.mt5)
     broker.connect()
     try:
         for symbol in args.symbol or cfg.trading.symbols:
             info = broker.symbol_info(symbol)
-            bars = broker.get_rates(symbol, cfg.trading.timeframe, args.bars)
-            path = Path(args.out) / f"{symbol}_{cfg.trading.timeframe}.csv"
-            save_bars(bars, str(path), info)
-            print(f"Saved {len(bars)} bars to {path} (+ contract spec {path.with_suffix('.json').name})")
+            for tf in [cfg.trading.timeframe] + cfg.model.context_timeframes:
+                count = int(args.days * 1440 / TIMEFRAME_MINUTES[tf]) + cfg.model.context_bars
+                bars = broker.get_rates(symbol, tf, count)
+                path = Path(args.out) / f"{symbol}_{tf}.csv"
+                save_bars(bars, str(path), info)
+                print(f"Saved {len(bars):7d} {tf:>4} bars to {path} ({bars['time'].iat[0]} -> {bars['time'].iat[-1]})")
     finally:
         broker.shutdown()
     return 0
@@ -115,33 +127,47 @@ def cmd_export(cfg: BotConfig, args) -> int:
 
 def cmd_backtest(cfg: BotConfig, args) -> int:
     from .backtest import run_backtest
-    from .data import load_bars, synthetic_bars
+    from .data import load_bars, load_context, synthetic_market
 
+    base_tf = cfg.trading.timeframe
     if args.csv:
         bars = load_bars(args.csv)
-        symbol = args.symbol[0] if args.symbol else Path(args.csv).stem.split("_")[0]
+        symbol = args.symbol[0] if args.symbol else Path(args.csv).stem.rsplit("_", 1)[0]
+        context = load_context(args.csv, base_tf, cfg.model.context_timeframes, bars)
     else:
-        symbol = args.symbol[0] if args.symbol else "SYNTH"
-        bars = synthetic_bars(args.synthetic, seed=args.seed, minutes=cfg.timeframe_minutes)
-        log.info("Using %d synthetic bars (pipeline demo only - not evidence of real-market performance)", len(bars))
+        symbol = args.symbol[0] if args.symbol else "XAUUSD-SIM"
+        bars, context = synthetic_market(args.synthetic, base_tf, cfg.model.context_timeframes, seed=args.seed)
+        log.info("Using %d synthetic gold-like bars (pipeline demo only - not evidence of real-market "
+                 "performance)", len(bars))
     if args.bars:
         bars = bars.iloc[-args.bars:].reset_index(drop=True)
     info = _symbol_info(cfg, symbol, args.csv)
-    out = Path(args.out) / f"{symbol}_{cfg.trading.timeframe}"
+    out = Path(args.out) / f"{symbol}_{base_tf}"
     out.mkdir(parents=True, exist_ok=True)
-    log.info("Backtesting %s on %d bars (%s -> %s); output in %s", symbol, len(bars),
-             bars["time"].iat[0], bars["time"].iat[-1], out)
-    res = run_backtest(cfg, bars, symbol, info, out_dir=str(out), warmup_bars=args.warmup)
+    log.info("Backtesting %s on %d %s bars (%s -> %s) reading %s; output in %s", symbol, len(bars), base_tf,
+             bars["time"].iat[0], bars["time"].iat[-1], ", ".join([base_tf] + list(context)), out)
+    res = run_backtest(cfg, bars, symbol, info, context=context, out_dir=str(out), warmup_bars=args.warmup)
     stats = dict(res.stats)
     model = stats.pop("model")
+    outlooks = stats.pop("outlooks")
+    stats.pop("learning_history", None)
     print("\n=== Backtest summary ===")
     for k, v in stats.items():
         print(f"{k:>22}: {v}")
-    print("\n=== What the model learned (per arm) ===")
+    print("\n=== Trade setups (what the brain learned) ===")
     for key, s in model.items():
-        print(f"{key:>18}: {json.dumps(s)}")
+        print(f"{key:>20}: {json.dumps(s)}")
+    print("\n=== Direction forecasts per timeframe ===")
+    for tf, s in outlooks.items():
+        print(f"{tf:>20}: {json.dumps(s)}")
     print(f"\nFiles in {out}: {', '.join(sorted(p.name for p in out.iterdir()))}")
     return 0
+
+
+def _fmt(v, pct=False):
+    if v is None:
+        return "  -  "
+    return f"{v:5.1%}" if pct else f"{v:+.3f}"
 
 
 def cmd_status(cfg: BotConfig, args) -> int:
@@ -150,16 +176,39 @@ def cmd_status(cfg: BotConfig, args) -> int:
     state = Path(cfg.paths.state_dir)
     files = sorted(state.glob("brain_*.joblib"))
     if not files:
-        print(f"No saved models in {state}/")
+        print(f"No saved brain in {state}/ yet - it is created the first time you run `live`.")
     for f in files:
         brain = Brain.load(f)
-        print(f"\n{f.name}: {brain.n_learned} samples learned")
+        print(f"\n=== {f.name}: {brain.n_learned} bars learned, {len(brain.history)} days of history ===")
+        print("\nTrade setups:")
         for key, s in brain.summary().items():
-            print(f"  {key:>18}: {json.dumps(s)}")
+            print(f"  {key:>20}: {json.dumps(s)}")
+        print("\nDirection forecasts (is price higher one candle later?):")
+        for tf, s in brain.outlook_summary().items():
+            print(f"  {tf:>4}: {json.dumps(s)}")
+        if brain.history:
+            tfs = list(brain.outlook_stats)
+            print("\nIs it getting smarter? (one row per day; accuracy = recent direction hit rate, "
+                  "best skill = best setup's edge over guessing)")
+            print("  date        " + " ".join(f"{tf:>6}" for tf in tfs) + "   best skill   paper trades")
+            for h in brain.history[-args.days:]:
+                acc = " ".join(_fmt(h["outlooks"].get(tf, {}).get("accuracy"), pct=True).rjust(6) for tf in tfs)
+                skills = [v["skill"] for v in h["setups"].values() if v["skill"] is not None]
+                papers = sum(v["paper_n"] for v in h["setups"].values())
+                print(f"  {h['date']}  {acc}   {_fmt(max(skills) if skills else None):>10}   {papers:>12}")
     risk = state / "bot_state.json"
     if risk.exists():
-        print(f"\nRisk state: {json.dumps(json.loads(risk.read_text())['risk'], indent=2)}")
+        data = json.loads(risk.read_text())
+        print(f"\nRisk state (account {data.get('account')}): {json.dumps(data['risk'], indent=2)}")
     return 0
+
+
+def cmd_readiness(cfg: BotConfig, args) -> int:
+    from .readiness import assess
+
+    res = assess(cfg, account=args.account, symbol=args.symbol)
+    print(res.report())
+    return 0 if res.ready else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -175,20 +224,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     bt = sub.add_parser("backtest", help="walk-forward backtest")
     src = bt.add_mutually_exclusive_group()
-    src.add_argument("--csv", help="bars CSV (from `export` or the MT5 terminal's Export Bars)")
-    src.add_argument("--synthetic", type=int, default=30000, help="number of synthetic bars (default)")
+    src.add_argument("--csv", help="trading-timeframe CSV, e.g. data/XAUUSD_M5.csv; the other charts "
+                                   "(XAUUSD_M1.csv, ...) are read from the same folder")
+    src.add_argument("--synthetic", type=int, default=20000, help="number of synthetic bars (default)")
     bt.add_argument("--symbol", nargs="*", help="symbol name (default: from the CSV file name)")
     bt.add_argument("--bars", type=int, help="only use the last N bars")
     bt.add_argument("--warmup", type=int, help="bars to learn from before trading (default: config)")
     bt.add_argument("--seed", type=int, default=1)
     bt.add_argument("--out", default="backtests")
 
-    ex = sub.add_parser("export", help="download history from MT5 to CSV")
+    ex = sub.add_parser("export", help="download history of every chart from MT5 to CSV")
     ex.add_argument("--symbol", nargs="*")
-    ex.add_argument("--bars", type=int, default=100_000)
+    ex.add_argument("--days", type=int, default=180, help="calendar days of history (default 180)")
     ex.add_argument("--out", default="data")
 
-    sub.add_parser("status", help="show what the saved models learned")
+    st = sub.add_parser("status", help="show what the brain learned and its progress")
+    st.add_argument("--days", type=int, default=30, help="days of learning history to show")
+
+    rd = sub.add_parser("readiness", help="check whether the demo record justifies going live")
+    rd.add_argument("--account", type=int, help="only count trades of this (demo) account number")
+    rd.add_argument("--symbol")
     return p
 
 
@@ -203,7 +258,7 @@ def main(argv=None) -> int:
     if config_path is None:
         log.info("No config.yaml found - using defaults (copy config.example.yaml to config.yaml)")
     handlers = {"check": cmd_check, "live": cmd_live, "backtest": cmd_backtest,
-                "export": cmd_export, "status": cmd_status}
+                "export": cmd_export, "status": cmd_status, "readiness": cmd_readiness}
     try:
         return handlers[args.command](cfg, args)
     except KeyboardInterrupt:

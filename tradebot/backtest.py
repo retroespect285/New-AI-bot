@@ -12,7 +12,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -67,14 +67,16 @@ def compute_stats(trades: List[ClosedTrade], equity: pd.DataFrame, initial: floa
 
 
 def run_backtest(cfg: BotConfig, bars: pd.DataFrame, symbol: str, info: SymbolInfo,
+                 context: Optional[Dict[str, pd.DataFrame]] = None,
                  out_dir: Optional[str] = None, warmup_bars: Optional[int] = None,
                  log_decisions: bool = True, progress: bool = True) -> BacktestResult:
+    """``bars``: the trading timeframe; ``context``: bars of every ``model.context_timeframes`` chart."""
     bars = bars.reset_index(drop=True)
     n = len(bars)
     warmup = cfg.backtest.warmup_bars if warmup_bars is None else warmup_bars
-    warmup = max(warmup, cfg.model.horizon_bars + 300)
-    if n < warmup + cfg.model.horizon_bars + 10:
-        raise ValueError(f"Need more than {warmup + cfg.model.horizon_bars + 10} bars, got {n}")
+    warmup = max(warmup, 300)
+    if n < warmup + 50:
+        raise ValueError(f"Need more than {warmup + 50} bars, got {n}")
 
     sim = SimBroker({symbol: bars}, {symbol: info}, cfg.backtest.initial_balance,
                     cfg.trading.commission_per_lot, cfg.backtest.default_spread_points)
@@ -85,8 +87,8 @@ def run_backtest(cfg: BotConfig, bars: pd.DataFrame, symbol: str, info: SymbolIn
     t0 = time.time()
     # Features/labels are computed once for speed; both are causal (verified by the tests), and
     # BotCore only ever learns labels whose outcome window ended before the current bar.
-    prep = core.prepare(symbol, bars)
-    core.learn(symbol, prep, warmup - 1)
+    prep = core.prepare(symbol, bars, context)
+    core.learn_range(symbol, prep, warmup - 1, progress=progress)
 
     equity_rows = []
     r_by_ticket = {}
@@ -116,7 +118,10 @@ def run_backtest(cfg: BotConfig, bars: pd.DataFrame, symbol: str, info: SymbolIn
     stats["bars_traded"] = n - 1 - warmup
     stats["period"] = f"{bars['time'].iat[warmup]} -> {bars['time'].iat[-1]}"
     stats["seconds"] = round(time.time() - t0, 1)
-    stats["model"] = core.brains[symbol].summary()
+    brain = core.brains[symbol]
+    stats["model"] = brain.summary()
+    stats["outlooks"] = brain.outlook_summary()
+    stats["learning_history"] = brain.history[-5:]
     if out_dir:
         out = Path(out_dir)
         equity.to_csv(out / "equity.csv", index=False)

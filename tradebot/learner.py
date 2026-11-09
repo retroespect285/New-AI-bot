@@ -112,11 +112,15 @@ class RingBuffer:
 
 
 class AdaptiveLearner:
-    def __init__(self, n_features: int, cfg: ModelConfig, seed: int = 0):
+    def __init__(self, n_features: int, cfg: ModelConfig, seed: int = 0, horizon: int = 1):
         self.cfg = cfg
         self.seed = seed
         self.n_features = n_features
-        self.logit = OnlineLogit(n_features, cfg.logit_lr, cfg.logit_l2, cfg.scaler_span)
+        # Outcomes of a long-horizon forecast overlap heavily (a 24-hour trade checked every 5 minutes
+        # shares almost all of its future with the next one), so each new sample carries less news.
+        # ``overlap`` scales learning rate, tree-leaf size and the memory of the scores accordingly.
+        self.overlap = float(min(8.0, max(1.0, horizon / 12.0)))
+        self.logit = OnlineLogit(n_features, cfg.logit_lr / self.overlap, cfg.logit_l2, cfg.scaler_span)
         self.gbm = None
         self.gbm_version = 0
         self.buffer = RingBuffer(cfg.gbm_window, n_features)
@@ -161,28 +165,38 @@ class AdaptiveLearner:
         return self._gbm_cache[key]
 
     def components(self, X: np.ndarray, keys: np.ndarray, i: int, valid: np.ndarray) -> Dict[str, float]:
+        """Every expert's forecast for row ``i`` plus the blended forecast (``"p"``), frozen now.
+
+        The blend must be frozen at forecast time: re-blending later with newer weights would let
+        the weights - tuned on overlapping outcomes that are known by then - leak part of the
+        answer into the score."""
         comps = {"base": self.base_rate, "logit": self.logit.predict(X[i])}
         g = self.gbm_proba(X, keys, i, valid)
         if g is not None:
             comps["gbm"] = g
+        comps["p"] = self._mix(comps)
         return comps
 
-    def blend(self, comps: Dict[str, float]) -> float:
+    def _mix(self, comps: Dict[str, float]) -> float:
         w = self.weights()
-        p = sum(w[e] * comps[e] for e in comps if e in w)
-        norm = sum(w[e] for e in comps if e in w)
+        p = sum(w[e] * comps[e] for e in EXPERTS if e in comps)
+        norm = sum(w[e] for e in EXPERTS if e in comps)
         return p / norm if norm > 0 else self.base_rate
+
+    def blend(self, comps: Dict[str, float]) -> float:
+        """The blended probability of a forecast (as it was when the forecast was made)."""
+        return comps["p"] if "p" in comps else self._mix(comps)
 
     # ------------------------------------------------------------------ learning
     def update(self, x: np.ndarray, y: float, comps: Optional[Dict[str, float]]) -> None:
         """Score the forecast ``comps`` (made before the outcome was known), then learn ``(x, y)``."""
-        d = self.cfg.loss_decay
+        d = 1.0 - (1.0 - self.cfg.loss_decay) / self.overlap
         if comps is not None and self.n_updates >= 50:  # let the experts settle before keeping score
             p_blend = self.blend(comps)
             for e in EXPERTS:
                 # an expert that had no forecast is charged the base-rate loss (neutral)
                 self.loss[e] = d * self.loss[e] + _logloss(comps.get(e, comps["base"]), y)
-            ds = self.cfg.skill_decay
+            ds = 1.0 - (1.0 - self.cfg.skill_decay) / self.overlap
             self.skill_blend = ds * self.skill_blend + _logloss(p_blend, y)
             self.skill_base = ds * self.skill_base + _logloss(comps["base"], y)
             self.n_eval += 1
@@ -205,16 +219,23 @@ class AdaptiveLearner:
             return False
         from sklearn.ensemble import HistGradientBoostingClassifier
 
-        model = HistGradientBoostingClassifier(
+        params = dict(
             max_iter=self.cfg.gbm_max_iter,
             learning_rate=self.cfg.gbm_learning_rate,
             max_depth=self.cfg.gbm_max_depth,
             max_bins=63,
-            min_samples_leaf=self.cfg.gbm_min_samples_leaf,
+            min_samples_leaf=int(min(self.cfg.gbm_min_samples_leaf * self.overlap, max(20, len(y) // 20))),
             l2_regularization=1.0,
             early_stopping=False,
             random_state=self.seed,
         )
+        if getattr(self.cfg, "gbm_max_features", 1.0) < 1.0:
+            params["max_features"] = self.cfg.gbm_max_features  # scikit-learn >= 1.4
+        try:
+            model = HistGradientBoostingClassifier(**params)
+        except TypeError:  # older scikit-learn without max_features
+            params.pop("max_features", None)
+            model = HistGradientBoostingClassifier(**params)
         # Recency comes from the rolling window: only the latest ``gbm_window`` samples are used, so
         # patterns from old market regimes drop out. (Per-sample weights are avoided on purpose:
         # they make scikit-learn's histogram binning ~30x slower.)
@@ -231,7 +252,7 @@ class AdaptiveLearner:
     # ------------------------------------------------------------------ diagnostics
     def skill(self) -> float:
         """Log-loss skill score of the blend vs. the base rate (>0 means the chart helps)."""
-        if self.n_eval < self.cfg.min_eval_samples or self.skill_base <= 0:
+        if self.n_eval < self.cfg.min_eval_samples * self.overlap or self.skill_base <= 0:
             return float("-inf")
         return 1.0 - self.skill_blend / self.skill_base
 

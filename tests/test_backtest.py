@@ -55,3 +55,25 @@ def test_csv_roundtrip_and_mt5_terminal_format(tmp_path):
     df = load_bars(str(mt5))
     assert list(df.columns) == ["time", "open", "high", "low", "close", "tick_volume", "spread"]
     assert df["time"].iat[1] == pd.Timestamp("2024-01-02 00:05") and df["spread"].iat[1] == 9
+
+
+def test_multi_timeframe_backtest_has_no_look_ahead(tmp_path):
+    from tests.conftest import mtf_config
+    from tradebot.data import synthetic_market
+    from tradebot.types import SymbolInfo
+
+    gold = SymbolInfo(name="XAUUSD", point=0.01, digits=2, tick_size=0.01, tick_value=1.0, contract_size=100)
+    cfg = mtf_config()
+    bars, ctx = synthetic_market(2600, "M5", cfg.model.context_timeframes, seed=23)
+    cut = 2200
+    end = bars["time"].iat[cut - 1] + pd.Timedelta(minutes=5)
+    short_ctx = {tf: d[d["time"] < end] for tf, d in ctx.items()}
+    short, full = tmp_path / "short", tmp_path / "full"
+    run_backtest(cfg, bars.iloc[:cut].reset_index(drop=True), "XAUUSD", gold, context=short_ctx,
+                 out_dir=str(short), warmup_bars=1300, progress=False)
+    res = run_backtest(cfg, bars, "XAUUSD", gold, context=ctx, out_dir=str(full), warmup_bars=1300, progress=False)
+    a = pd.read_csv(short / "decisions.csv")
+    b = pd.read_csv(full / "decisions.csv").iloc[: len(a)]
+    assert len(a) > 800 and "up_H1" in a.columns
+    pd.testing.assert_frame_equal(a.reset_index(drop=True), b.reset_index(drop=True))
+    assert set(res.stats["outlooks"]) == {"M5", "M30", "H1"}

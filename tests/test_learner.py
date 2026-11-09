@@ -66,3 +66,18 @@ def test_unscored_updates_still_learn():
         learner.update(np.zeros(3), 1.0, None)
     assert learner.n_updates == 100 and learner.n_eval == 0
     assert learner.base_rate > 0.9
+
+
+def test_forecast_is_frozen_when_it_is_made():
+    """Scoring must use the blend as it was at forecast time, not one re-weighted later with
+    knowledge of overlapping outcomes."""
+    cfg = small_config().model
+    rng = np.random.default_rng(5)
+    X, y = _stream(600, rng)
+    learner = AdaptiveLearner(6, cfg, seed=1)
+    _run(learner, X[:300], y[:300])
+    keys, valid = np.arange(600), np.ones(600, dtype=bool)
+    comps = learner.components(X, keys, 300, valid)
+    p_then = learner.blend(comps)
+    _run(learner, X[300:], y[300:])  # weights move on
+    assert learner.blend(comps) == p_then

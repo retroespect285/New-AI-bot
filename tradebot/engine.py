@@ -12,6 +12,7 @@ from .brokers.base import Broker, BrokerError
 from .config import BotConfig
 from .core import BotCore
 from .journal import Journal
+from .readiness import assess
 
 log = logging.getLogger(__name__)
 
@@ -31,30 +32,45 @@ class LiveEngine:
         log.info("Stop requested - finishing the current cycle...")
         self._running = False
 
+    def fetch_context(self, symbol: str, base_bars: int) -> Dict[str, pd.DataFrame]:
+        """Bars of every context chart (M1, M30, H1, H4 ...) covering ``base_bars`` trading bars."""
+        return {tf: self.broker.get_rates(symbol, tf, self.cfg.context_fetch_bars(tf, base_bars))
+                for tf in self.cfg.model.context_timeframes}
+
     def start(self) -> BotCore:
         cfg = self.cfg
         self.broker.connect()
         acct = self.broker.account()
         log.info("Account %s | balance %.2f %s | equity %.2f | %s", acct.login, acct.balance, acct.currency,
                  acct.equity, "DEMO" if acct.is_demo else "REAL MONEY")
-        if not acct.is_demo and not cfg.mt5.allow_live_account and not self.dry_run:
-            raise BrokerError(
-                "This is a REAL-MONEY account. Trading it requires `mt5.allow_live_account: true` in the "
-                "config. Run on a demo account first (or use --dry-run)."
-            )
+        if not acct.is_demo and not self.dry_run:
+            if not cfg.mt5.allow_live_account:
+                raise BrokerError(
+                    "This is a REAL-MONEY account. Trading it requires `mt5.allow_live_account: true` in the "
+                    "config. Run on a demo account first (or use --dry-run)."
+                )
+            ready = assess(cfg)
+            for line in ready.report().splitlines():
+                (log.info if ready.ready else log.warning)(line)
         if self.dry_run:
             log.info("DRY-RUN mode: decisions are logged, no orders will be sent")
         core = BotCore(cfg, self.broker, journal=self.journal, state_dir=cfg.paths.state_dir, dry_run=self.dry_run)
+        core.bind_account(acct)
         for symbol in cfg.trading.symbols:
             info = core.add_symbol(symbol)
             log.info("%s: point %g, digits %d, tick value %g, lots %g..%g step %g, stops level %d",
                      symbol, info.point, info.digits, info.tick_value, info.volume_min, info.volume_max,
                      info.volume_step, info.stops_level)
             bars = self.broker.get_rates(symbol, cfg.trading.timeframe, cfg.trading.warmup_bars)
-            if len(bars) < cfg.model.min_train_samples + cfg.model.horizon_bars + 300:
-                log.warning("%s: only %d bars of history available - the model needs time to learn before it "
-                            "trades. Increase 'Max bars in chart' in MT5 (Tools > Options > Charts).", symbol, len(bars))
-            core.warmup(symbol, bars)
+            context = self.fetch_context(symbol, len(bars))
+            log.info("%s: studying %d %s bars (%s -> %s) together with %s", symbol, len(bars), cfg.trading.timeframe,
+                     bars["time"].iat[0], bars["time"].iat[-1],
+                     ", ".join(f"{len(b)} {tf}" for tf, b in context.items()))
+            if len(bars) < cfg.model.min_train_samples + cfg.model.max_hold + 300:
+                log.warning("%s: only %d bars of history available - the brain needs time to learn before it "
+                            "trades. Set 'Max bars in chart' to Unlimited in MT5 (Tools > Options > Charts).",
+                            symbol, len(bars))
+            core.warmup(symbol, bars, context)
             self._last_bar[symbol] = bars["time"].iat[-1]
             self._log_model(core, symbol)
         core.save_state()
@@ -88,7 +104,7 @@ class LiveEngine:
                         log.exception("%s: unexpected error (continuing)", symbol)
                 if processed:
                     cycles += 1
-                    try:  # risk state every bar, the (larger) models every `save_models_every` bars
+                    try:  # risk state every bar, the (larger) brains every `save_models_every` bars
                         core.save_state(models=cycles % max(1, cfg.trading.save_models_every) == 0)
                     except Exception:
                         log.exception("Could not save state")
@@ -112,21 +128,28 @@ class LiveEngine:
         if self._last_bar.get(symbol) is not None and bar_time <= self._last_bar[symbol]:
             return False
         bars = self.broker.get_rates(symbol, cfg.trading.timeframe, cfg.trading.lookback_bars)
+        context = self.fetch_context(symbol, len(bars))
         core.add_symbol(symbol)  # refresh the contract spec (tick value moves with FX rates)
-        prep = core.prepare(symbol, bars)
+        prep = core.prepare(symbol, bars, context)
         decision = core.on_bar(symbol, prep)
         self._last_bar[symbol] = bars["time"].iat[-1]
         best = max(decision.evals, key=lambda e: e.ev_r) if decision.evals else None
-        log.info("%s bar %s | %s | %s%s", symbol, bar_time, decision.action, decision.reason,
-                 f" | best {best.arm.key} p={best.prob:.2f} EV={best.ev_r:+.2f}R" if best else "")
+        log.info("%s %s | %s | %s%s | outlook %s", symbol, bar_time.strftime("%Y-%m-%d %H:%M"), decision.action,
+                 decision.reason, f" | best {best.arm.key} p={best.prob:.2f} EV={best.ev_r:+.2f}R" if best else "",
+                 decision.outlook_text() or "-")
         self._bars_seen[symbol] = self._bars_seen.get(symbol, 0) + 1
-        if self._bars_seen[symbol] % 144 == 0:  # periodic model report
+        if self._bars_seen[symbol] % 144 == 0:  # periodic brain report (every 12 hours on M5)
             self._log_model(core, symbol)
         return True
 
     @staticmethod
     def _log_model(core: BotCore, symbol: str) -> None:
-        for key, s in core.brains[symbol].summary().items():
-            log.info("%s model %-17s samples %6d | TP rate %.2f skill %s | weights %s | paper trades %d, "
-                     "recent avg %+.2fR (t %.1f)", symbol, key, s["samples"], s["tp_rate"], s["skill_tp"],
-                     s["weights_tp(b/l/g)"], s["paper_trades"], s["paper_recent_avg_r"], s["paper_recent_tstat"])
+        brain = core.brains[symbol]
+        for key, s in brain.summary().items():
+            log.info("%s setup %-20s samples %6d | TP rate %.2f skill %s | paper trades %d, recent avg %+.2fR (t %.1f)",
+                     symbol, key, s["samples"], s["tp_rate"], s["skill_tp"], s["paper_trades"],
+                     s["paper_recent_avg_r"], s["paper_recent_tstat"])
+        for tf, s in brain.outlook_summary().items():
+            acc = "n/a" if s["recent_accuracy"] is None else f"{s['recent_accuracy']:.1%}"
+            log.info("%s outlook %-4s direction accuracy (recent) %s over %d scored forecasts, skill %s",
+                     symbol, tf, acc, s["forecasts_scored"], s["skill"])

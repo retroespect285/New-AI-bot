@@ -33,20 +33,22 @@ class MT5Config:
 
 @dataclass
 class SessionConfig:
-    start_hour: int = 0  # broker server time, inclusive
-    end_hour: int = 24  # broker server time, exclusive
+    # Broker *server* time. Gold spreads jump around the daily roll-over at server midnight, so
+    # the default skips the first and last hour of the server day.
+    start_hour: int = 1  # inclusive
+    end_hour: int = 23  # exclusive
 
 
 @dataclass
 class TradingConfig:
-    symbols: List[str] = field(default_factory=lambda: ["EURUSD"])
-    timeframe: str = "M5"
+    symbols: List[str] = field(default_factory=lambda: ["XAUUSD"])
+    timeframe: str = "M5"  # the bot decides once per closed bar of this chart
     magic: int = 285001
     dry_run: bool = False  # log decisions but never send orders
     poll_seconds: float = 5.0
-    lookback_bars: int = 1500  # bars fetched each cycle to compute indicators
-    warmup_bars: int = 20000  # history used to pre-train the model at start-up
-    deviation_points: int = 20
+    lookback_bars: int = 1500  # trading-timeframe bars fetched each cycle
+    warmup_bars: int = 20000  # history (trading-timeframe bars) studied at start-up
+    deviation_points: int = 30
     comment: str = "ai-bot"
     session: SessionConfig = field(default_factory=SessionConfig)
     friday_cutoff_hour: Optional[int] = 20  # no new trades + flatten after this hour on Fridays
@@ -55,37 +57,56 @@ class TradingConfig:
     # Round-turn commission per 1.0 lot charged by your broker (account currency). Used to make the
     # learning labels cost-aware and by the backtest simulator. 0 for spread-only accounts.
     commission_per_lot: float = 0.0
+    # Optional CSV of high-impact news (columns: time [server time], optional title,
+    # minutes_before, minutes_after). No new trades are opened inside those windows.
+    news_file: Optional[str] = None
+    news_minutes_before: int = 15
+    news_minutes_after: int = 15
 
 
 @dataclass
-class ExitProfile:
-    sl_atr: float
-    tp_atr: float
+class TradeStyle:
+    """One way of trading the chart: stop-loss / take-profit measured in the ATR of ``timeframe``
+    and a maximum holding time in trading-timeframe bars."""
+
+    timeframe: str = "M5"
+    sl_atr: float = 1.0
+    tp_atr: float = 1.5
+    max_hold_bars: int = 24
 
     @property
     def name(self) -> str:
-        return f"sl{self.sl_atr:g}_tp{self.tp_atr:g}"
+        return f"{self.timeframe}:sl{self.sl_atr:g}_tp{self.tp_atr:g}"
+
+
+def _gold_styles() -> List[TradeStyle]:
+    return [
+        TradeStyle("M5", 1.5, 2.0, 12),    # scalp: up to 1 hour
+        TradeStyle("M30", 1.0, 1.5, 48),   # intraday: up to 4 hours
+        TradeStyle("H1", 1.0, 2.0, 96),    # intraday swing: up to 8 hours
+        TradeStyle("H4", 1.0, 1.5, 288),   # day trade on the 4-hour picture: up to 24 hours
+    ]
 
 
 @dataclass
 class ModelConfig:
-    horizon_bars: int = 24  # max holding time; also the label horizon
     atr_period: int = 14
-    exit_profiles: List[ExitProfile] = field(
-        default_factory=lambda: [
-            ExitProfile(1.0, 1.5),
-            ExitProfile(1.5, 2.5),
-            ExitProfile(2.0, 4.0),
-        ]
-    )
-    min_train_samples: int = 1500  # learned samples before an arm may trade
+    # Charts read in addition to the trading timeframe. M1 shows every small movement inside each
+    # 5-minute candle; M30/H1/H4 show the bigger picture.
+    context_timeframes: List[str] = field(default_factory=lambda: ["M1", "M30", "H1", "H4"])
+    context_bars: int = 600  # extra bars fetched per context chart for its indicators
+    # Direction forecasts ("will price be higher in 5 min / 30 min / 1 h / 4 h?") made every bar
+    # and scored when the answer is known - the bot's report card per timeframe.
+    outlooks: List[str] = field(default_factory=lambda: ["M5", "M30", "H1", "H4"])
+    styles: List[TradeStyle] = field(default_factory=_gold_styles)
+    min_train_samples: int = 1500  # learned samples before a setup may trade
     min_eval_samples: int = 1000  # out-of-sample evaluations before skill is trusted
     min_skill: float = 0.005  # required improvement over the base rate (log-loss skill score)
     min_ev_r: float = 0.10  # minimum expected value, in R (multiples of the risk)
     min_prob: float = 0.0  # optional extra filter on win probability
     # Paper trading: every signal is also traded on paper (one at a time per setup). A setup may
-    # only trade for real while its last ``paper_window`` paper trades made money on average with
-    # some statistical confidence (t-statistic of the mean R).
+    # only trade for real while its last ``paper_window`` trades made money on average with some
+    # statistical confidence (t-statistic of the mean R).
     paper_window: int = 40
     min_paper_trades: int = 20
     min_paper_avg_r: float = 0.0
@@ -103,10 +124,16 @@ class ModelConfig:
     gbm_learning_rate: float = 0.05
     gbm_max_depth: int = 3  # shallow trees: market data is noisy, deep trees memorise noise
     gbm_min_samples_leaf: int = 40
+    gbm_max_features: float = 0.5  # fraction of features considered per split
     n_threads: int = 1  # CPU threads for the gradient-boosting model
-    outcome_alpha: float = 0.01  # EWMA rate for the average win / loss R of each arm
-    slippage_points: float = 1.0  # extra cost assumed per trade when labelling
+    outcome_alpha: float = 0.01  # EWMA rate for the average win / loss R of each setup
+    slippage_points: float = 3.0  # extra cost assumed per trade when labelling
+    backup_days: int = 7  # daily copies of the brain kept in state/backups
     seed: int = 7
+
+    @property
+    def max_hold(self) -> int:
+        return max(s.max_hold_bars for s in self.styles)
 
 
 @dataclass
@@ -127,9 +154,20 @@ class RiskConfig:
 
 
 @dataclass
+class ReadinessConfig:
+    """What a demo record must show before ``tradebot readiness`` says "ready for live"."""
+
+    min_days: int = 14
+    min_trades: int = 30
+    min_profit_factor: float = 1.2
+    min_avg_r: float = 0.0
+    max_drawdown_pct: float = 10.0
+
+
+@dataclass
 class BacktestConfig:
     initial_balance: float = 10_000.0
-    default_spread_points: float = 10.0  # used if the data has no spread column
+    default_spread_points: float = 25.0  # used if the data has no spread column
     warmup_bars: int = 6000  # bars used only for learning before the simulation trades
     symbol_info: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
@@ -146,6 +184,7 @@ class BotConfig:
     trading: TradingConfig = field(default_factory=TradingConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    readiness: ReadinessConfig = field(default_factory=ReadinessConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
 
@@ -153,21 +192,43 @@ class BotConfig:
     def timeframe_minutes(self) -> int:
         return TIMEFRAME_MINUTES[self.trading.timeframe]
 
+    def context_fetch_bars(self, tf: str, base_bars: int) -> int:
+        """Bars of context timeframe ``tf`` that cover ``base_bars`` trading bars plus indicator history."""
+        span_minutes = base_bars * self.timeframe_minutes
+        return int(span_minutes // TIMEFRAME_MINUTES[tf]) + self.model.context_bars
+
+    def outlook_horizons(self) -> Dict[str, int]:
+        return {tf: TIMEFRAME_MINUTES[tf] // self.timeframe_minutes for tf in self.model.outlooks}
+
     def validate(self) -> "BotConfig":
         t, m, r = self.trading, self.model, self.risk
         if t.timeframe not in TIMEFRAME_MINUTES:
             raise ConfigError(f"Unknown timeframe {t.timeframe!r}; use one of {list(TIMEFRAME_MINUTES)}")
         if not t.symbols:
             raise ConfigError("trading.symbols must list at least one symbol")
-        if not m.exit_profiles:
-            raise ConfigError("model.exit_profiles must not be empty")
-        for p in m.exit_profiles:
-            if p.sl_atr <= 0 or p.tp_atr <= 0:
-                raise ConfigError("exit profile multiples must be positive")
-        if m.horizon_bars < 1:
-            raise ConfigError("model.horizon_bars must be >= 1")
-        if t.lookback_bars < 400 + m.horizon_bars:
-            raise ConfigError("trading.lookback_bars is too small for the indicators (need >= 400 + horizon)")
+        base = t.timeframe
+        for tf in m.context_timeframes:
+            if tf not in TIMEFRAME_MINUTES:
+                raise ConfigError(f"model.context_timeframes: unknown timeframe {tf!r}")
+            if tf == base:
+                raise ConfigError(f"model.context_timeframes must not repeat the trading timeframe {base}")
+        if len(set(m.context_timeframes)) != len(m.context_timeframes):
+            raise ConfigError("model.context_timeframes has duplicates")
+        if not m.styles:
+            raise ConfigError("model.styles must not be empty")
+        for s in m.styles:
+            if s.timeframe != base and s.timeframe not in m.context_timeframes:
+                raise ConfigError(f"style timeframe {s.timeframe} must be {base} or one of model.context_timeframes")
+            if s.sl_atr <= 0 or s.tp_atr <= 0 or s.max_hold_bars < 1:
+                raise ConfigError("style sl_atr / tp_atr must be > 0 and max_hold_bars >= 1")
+        if len({s.name for s in m.styles}) != len(m.styles):
+            raise ConfigError("model.styles has duplicates")
+        for tf in m.outlooks:
+            minutes = TIMEFRAME_MINUTES.get(tf)
+            if minutes is None or minutes < self.timeframe_minutes or minutes % self.timeframe_minutes:
+                raise ConfigError(f"model.outlooks: {tf!r} must be a timeframe that is a multiple of {base}")
+        if t.lookback_bars < 300 + m.max_hold:
+            raise ConfigError(f"trading.lookback_bars must be >= 300 + the longest max_hold_bars ({300 + m.max_hold})")
         if not 0 < r.risk_per_trade_pct <= 5:
             raise ConfigError("risk.risk_per_trade_pct must be in (0, 5]")
         if not 0 < m.loss_decay < 1 or not 0 < m.skill_decay < 1:
@@ -186,14 +247,15 @@ def _build(cls, data: Optional[dict], where: str):
     fields = {f.name: f for f in dataclasses.fields(cls)}
     unknown = set(data) - set(fields)
     if unknown:
-        raise ConfigError(f"Unknown key(s) in {where}: {sorted(unknown)}")
+        hint = " (exit_profiles/horizon_bars were replaced by model.styles)" if {"exit_profiles", "horizon_bars"} & unknown else ""
+        raise ConfigError(f"Unknown key(s) in {where}: {sorted(unknown)}{hint}")
     kwargs = {}
     for name, value in data.items():
         sub = _SUBSECTIONS.get((cls, name))
         if sub is not None:
             kwargs[name] = _build(sub, value, f"{where}.{name}")
-        elif (cls, name) == (ModelConfig, "exit_profiles"):
-            kwargs[name] = [_build(ExitProfile, p, f"{where}.exit_profiles[{i}]") for i, p in enumerate(value)]
+        elif (cls, name) == (ModelConfig, "styles"):
+            kwargs[name] = [_build(TradeStyle, p, f"{where}.styles[{i}]") for i, p in enumerate(value)]
         else:
             kwargs[name] = value
     return cls(**kwargs)
@@ -204,6 +266,7 @@ _SUBSECTIONS = {
     (BotConfig, "trading"): TradingConfig,
     (BotConfig, "model"): ModelConfig,
     (BotConfig, "risk"): RiskConfig,
+    (BotConfig, "readiness"): ReadinessConfig,
     (BotConfig, "backtest"): BacktestConfig,
     (BotConfig, "paths"): PathsConfig,
     (TradingConfig, "session"): SessionConfig,

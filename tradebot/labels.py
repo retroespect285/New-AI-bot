@@ -17,23 +17,28 @@ import numpy as np
 import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 
-from .config import ExitProfile
+from .config import TradeStyle
 from .types import Side
 
 
 @dataclass(frozen=True)
 class Arm:
+    """One candidate trade: direction x style (stop/target in ATR of ``tf``, max holding time)."""
+
     side: Side
+    tf: str
     sl_atr: float
     tp_atr: float
+    horizon: int  # max holding time in trading-timeframe bars
 
     @property
     def key(self) -> str:
-        return f"{self.side.label}:sl{self.sl_atr:g}_tp{self.tp_atr:g}"
+        return f"{self.side.label}:{self.tf}:sl{self.sl_atr:g}_tp{self.tp_atr:g}"
 
 
-def make_arms(profiles: List[ExitProfile]) -> List[Arm]:
-    return [Arm(side, p.sl_atr, p.tp_atr) for p in profiles for side in (Side.BUY, Side.SELL)]
+def make_arms(styles: List[TradeStyle]) -> List[Arm]:
+    return [Arm(side, s.timeframe, s.sl_atr, s.tp_atr, s.max_hold_bars)
+            for s in styles for side in (Side.BUY, Side.SELL)]
 
 
 @dataclass
@@ -61,7 +66,8 @@ def label_arm(
     default_spread_points: float = 10.0,
     extra_cost: float = 0.0,
 ) -> ArmLabels:
-    """Vectorised triple-barrier outcome for one arm. Bars are bid prices (MT5 convention)."""
+    """Vectorised triple-barrier outcome for one arm. Bars are bid prices (MT5 convention).
+    ``atr`` is the ATR (price units) that sizes this arm's stop and target at every bar."""
     n = len(bars)
     win = np.full(n, np.nan)
     loss = np.full(n, np.nan)
@@ -130,14 +136,23 @@ def label_arm(
 
 def label_all(
     bars: pd.DataFrame,
-    atr: np.ndarray,
+    atr_tf: Dict[str, np.ndarray],
     arms: List[Arm],
-    horizon: int,
     point: float,
     default_spread_points: float = 10.0,
     extra_cost: float = 0.0,
 ) -> Dict[str, ArmLabels]:
     return {
-        arm.key: label_arm(bars, atr, arm, horizon, point, default_spread_points, extra_cost)
+        arm.key: label_arm(bars, atr_tf[arm.tf], arm, arm.horizon, point, default_spread_points, extra_cost)
         for arm in arms
     }
+
+
+def direction_labels(bars: pd.DataFrame, horizon: int) -> np.ndarray:
+    """1.0 if the close ``horizon`` bars later is higher than the close of bar t, else 0.0
+    (NaN where the future is not known yet)."""
+    c = bars["close"].to_numpy(dtype=np.float64)
+    out = np.full(len(c), np.nan)
+    if len(c) > horizon:
+        out[: len(c) - horizon] = (c[horizon:] > c[:-horizon]).astype(np.float64)
+    return out

@@ -4,8 +4,12 @@ from collections import namedtuple
 
 import numpy as np
 
+TIMEFRAME_M1 = 1
 TIMEFRAME_M5 = 5
+TIMEFRAME_M30 = 30
 TIMEFRAME_H1 = 16385
+TIMEFRAME_H4 = 16388
+_TF_SECONDS = {1: 60, 5: 300, 30: 1800, 16385: 3600, 16388: 14400}
 TRADE_ACTION_DEAL = 1
 TRADE_ACTION_SLTP = 6
 ORDER_TYPE_BUY = 0
@@ -48,7 +52,7 @@ class State:
         self.positions = []
         self.deals = []
         self.filling_mode = SYMBOL_FILLING_FOK | SYMBOL_FILLING_IOC
-        self.now = 1_700_000_000  # open time of the bar that is currently forming
+        self.now = 1_700_000_100  # open time of the M5 bar that is currently forming
 
 
 state = State()
@@ -91,9 +95,10 @@ def copy_rates_from_pos(symbol, timeframe, start, count):
     dtype = [("time", "<i8"), ("open", "<f8"), ("high", "<f8"), ("low", "<f8"), ("close", "<f8"),
              ("tick_volume", "<u8"), ("spread", "<i4"), ("real_volume", "<u8")]
     n = count
-    t0 = state.now - (n - 1) * 300
+    sec = _TF_SECONDS[timeframe]
+    t0 = (state.now // sec) * sec - (n - 1) * sec  # last element = the candle still forming
     arr = np.zeros(n, dtype=dtype)
-    arr["time"] = t0 + np.arange(n) * 300
+    arr["time"] = t0 + np.arange(n) * sec
     wave = 0.002 * np.sin(arr["time"] / 7_000.0)
     arr["open"] = 1.1 + wave
     arr["close"] = 1.1 + wave + 0.0001

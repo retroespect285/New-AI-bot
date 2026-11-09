@@ -1,5 +1,6 @@
 # Copy this file to config.yaml and adjust it.  Every key is optional (defaults shown).
 # Unknown keys are rejected, so typos are caught at start-up.
+# Defaults are set up for GOLD (XAUUSD) on MetaTrader 5.
 
 mt5:
   # Leave login/password/server empty to use the account the MT5 terminal is already logged in to,
@@ -12,37 +13,47 @@ mt5:
   allow_live_account: false  # SAFETY: the bot refuses to trade a real-money account unless true
 
 trading:
-  symbols: [EURUSD]          # exact names as shown in MT5 Market Watch (some brokers use EURUSD.m etc.)
-  timeframe: M5              # the bot acts once per closed bar: M5 = every 5 minutes
+  symbols: [XAUUSD]          # exact name from MT5 Market Watch: XAUUSD, GOLD, XAUUSD.m, XAUUSDm ...
+  timeframe: M5              # the bot decides once per closed candle: M5 = every 5 minutes
   magic: 285001              # tags this bot's orders so it never touches your manual trades
   dry_run: false             # true = log what it would do, never send orders
   poll_seconds: 5
-  lookback_bars: 1500        # bars used to compute indicators each cycle
-  warmup_bars: 20000         # history the model learns from at start-up (~70 days of M5)
-  deviation_points: 20       # max slippage accepted on market orders
+  lookback_bars: 1500        # M5 candles used each cycle (other charts are fetched to cover the same time)
+  warmup_bars: 20000         # history studied at start-up (~70 trading days of M5, plus M1/M30/H1/H4)
+  deviation_points: 30       # max slippage accepted on market orders (gold: 30 points = $0.30)
   comment: ai-bot
-  session:                   # broker *server* time; trades are only opened inside this window
-    start_hour: 0
-    end_hour: 24
+  session:                   # broker *server* time; new trades only inside this window
+    start_hour: 1            # skips the daily roll-over hour when gold spreads explode
+    end_hour: 23
   friday_cutoff_hour: 20     # no new trades and flatten open ones after this hour on Friday (null = off)
   stale_bar_tolerance: 3
-  save_models_every: 12      # models are saved every N bars (1 hour on M5) and on exit
-  commission_per_lot: 0.0    # round-turn commission per lot (e.g. 7.0 on many raw-spread accounts)
+  save_models_every: 12      # the brain file is saved every N candles (1 hour on M5) and on exit
+  commission_per_lot: 0.0    # round-turn commission per lot, if your account charges one
+  news_file: null            # e.g. data/news.csv - no new trades around high-impact news (see README)
+  news_minutes_before: 15
+  news_minutes_after: 15
 
 model:
-  horizon_bars: 24           # max holding time (24 x M5 = 2 hours); positions are closed after this
   atr_period: 14
-  exit_profiles:             # stop-loss / take-profit candidates, in multiples of ATR
-    - {sl_atr: 1.0, tp_atr: 1.5}
-    - {sl_atr: 1.5, tp_atr: 2.5}
-    - {sl_atr: 2.0, tp_atr: 4.0}
+  # Charts the bot reads besides the M5 chart it trades on.
+  context_timeframes: [M1, M30, H1, H4]
+  context_bars: 600
+  # Direction forecasts made every 5 minutes and scored later: "higher in 5 min / 30 min / 1 h / 4 h?"
+  outlooks: [M5, M30, H1, H4]
+  # Trade styles the bot chooses from (each as BUY or SELL). Stop-loss / take-profit are multiples of
+  # the ATR of the style's chart; max_hold_bars is in M5 candles (12 = 1 hour).
+  styles:
+    - {timeframe: M5,  sl_atr: 1.5, tp_atr: 2.0, max_hold_bars: 12}    # scalp, up to 1 hour
+    - {timeframe: M30, sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 48}    # intraday, up to 4 hours
+    - {timeframe: H1,  sl_atr: 1.0, tp_atr: 2.0, max_hold_bars: 96}    # intraday swing, up to 8 hours
+    - {timeframe: H4,  sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 288}   # 4-hour picture, up to 24 hours
   min_train_samples: 1500    # samples learned before a setup may trade
   min_eval_samples: 1000     # out-of-sample forecasts scored before the skill score is trusted
   min_skill: 0.005           # must beat the base rate by this much (log-loss skill score)
   min_ev_r: 0.10             # minimum expected value per trade, in R (1R = the money risked)
   min_prob: 0.0              # optional floor on the take-profit probability
   # Paper trading gate: every signal is also traded on paper; a setup trades for real only while
-  # its last `paper_window` paper trades are profitable on average (with t-statistic >= min_paper_tstat)
+  # its last `paper_window` trades are profitable on average (with t-statistic >= min_paper_tstat)
   paper_window: 40
   min_paper_trades: 20
   min_paper_avg_r: 0.0
@@ -60,9 +71,11 @@ model:
   gbm_learning_rate: 0.05
   gbm_max_depth: 3
   gbm_min_samples_leaf: 40
+  gbm_max_features: 0.5
   n_threads: 1
   outcome_alpha: 0.01
-  slippage_points: 1.0       # extra cost assumed per trade when learning
+  slippage_points: 3.0       # extra cost assumed per trade when learning (gold: $0.03)
+  backup_days: 7             # daily copies of the brain kept in state/backups
   seed: 7
 
 risk:
@@ -72,7 +85,7 @@ risk:
   max_daily_loss_pct: 3.0    # stop opening trades for the rest of the (server) day
   max_drawdown_pct: 15.0     # kill switch from the equity peak; delete state/bot_state.json to reset
   max_spread_sl_fraction: 0.25
-  max_spread_points: null
+  max_spread_points: null    # e.g. 60 for gold = never trade when the spread is above $0.60
   max_consecutive_losses: 4
   cooldown_minutes: 60
   adaptive_window: 10        # risk is scaled down after a run of losses and recovers with wins
@@ -80,13 +93,20 @@ risk:
   max_lots: 5.0
   breakeven_at_r: null       # e.g. 1.0 = move the stop to entry once the trade is +1R
 
+readiness:                   # what `python -m tradebot readiness` requires before saying "go live"
+  min_days: 14
+  min_trades: 30
+  min_profit_factor: 1.2
+  min_avg_r: 0.0
+  max_drawdown_pct: 10.0
+
 backtest:
   initial_balance: 10000
-  default_spread_points: 10  # used when the data has no spread column
+  default_spread_points: 25  # used when the data has no spread column
   warmup_bars: 6000          # bars used only for learning before the backtest starts trading
   symbol_info: {}            # contract specs when no <file>.json is next to the CSV, e.g.
-  #  EURUSD: {point: 0.00001, digits: 5, tick_size: 0.00001, tick_value: 1.0, contract_size: 100000}
+  #  XAUUSD: {point: 0.01, digits: 2, tick_size: 0.01, tick_value: 1.0, contract_size: 100}
 
 paths:
-  state_dir: state           # saved models + risk state (the bot resumes from here after a restart)
+  state_dir: state           # the brain files + risk state (the bot resumes from here after a restart)
   log_dir: logs              # bot.log + CSV journals (decisions, orders, closed trades, events)

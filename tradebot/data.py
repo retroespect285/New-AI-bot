@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
 from .brokers.base import BAR_COLUMNS
+from .config import TIMEFRAME_MINUTES
 from .types import SymbolInfo
+
+log = logging.getLogger(__name__)
 
 _ALIASES = {
     "date": "date", "time": "time", "datetime": "time", "timestamp": "time",
@@ -57,8 +61,67 @@ def load_symbol_info(csv_path: str) -> Optional[SymbolInfo]:
     return SymbolInfo(**json.loads(p.read_text(encoding="utf-8")))
 
 
+def resample_bars(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Build higher-timeframe candles (aligned like MT5: to the server day) from lower ones."""
+    t = pd.to_datetime(bars["time"])
+    key = t.dt.floor(f"{minutes}min")
+    g = bars.assign(_k=key.values).groupby("_k", sort=True)
+    out = pd.DataFrame({
+        "time": g["time"].first().index.astype("datetime64[ns]"),
+        "open": g["open"].first().to_numpy(),
+        "high": g["high"].max().to_numpy(),
+        "low": g["low"].min().to_numpy(),
+        "close": g["close"].last().to_numpy(),
+        "tick_volume": g["tick_volume"].sum().to_numpy() if "tick_volume" in bars else 0,
+        "spread": np.round(g["spread"].mean().to_numpy()).astype(int) if "spread" in bars else 0,
+    })
+    return out.reset_index(drop=True)
+
+
+def bars_path(directory: str, symbol: str, timeframe: str) -> Path:
+    return Path(directory) / f"{symbol}_{timeframe}.csv"
+
+
+def load_context(base_csv: str, base_tf: str, timeframes: List[str], base_bars: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Find the other charts next to ``<SYMBOL>_<TF>.csv`` (as written by ``tradebot export``).
+    Missing higher timeframes are rebuilt from the base bars; missing lower ones are an error."""
+    p = Path(base_csv)
+    stem = p.stem
+    prefix = stem[: -(len(base_tf) + 1)] if stem.upper().endswith("_" + base_tf) else stem
+    out = {}
+    for tf in timeframes:
+        candidate = p.parent / f"{prefix}_{tf}.csv"
+        if candidate.exists():
+            out[tf] = load_bars(str(candidate))
+        elif TIMEFRAME_MINUTES[tf] > TIMEFRAME_MINUTES[base_tf]:
+            log.warning("%s not found - building %s candles from %s", candidate.name, tf, p.name)
+            out[tf] = resample_bars(base_bars, TIMEFRAME_MINUTES[tf])
+        else:
+            raise FileNotFoundError(
+                f"{candidate} is missing. The bot reads the {tf} chart too: run `python -m tradebot export` "
+                f"to download every timeframe, or remove {tf} from model.context_timeframes.")
+    return out
+
+
+def synthetic_market(n_base: int, base_tf: str, timeframes: List[str], seed: int = 0,
+                     price: float = 2350.0, point: float = 0.01, start: str = "2024-01-01"):
+    """Synthetic gold-like market: 1-minute bars resampled into every timeframe needed.
+    Returns (base bars, {timeframe: bars}). For testing the pipeline only."""
+    base_min = TIMEFRAME_MINUTES[base_tf]
+    m1 = synthetic_bars(n_base * base_min + 60, seed=seed, start=start, minutes=1, price=price, point=point,
+                        vol=0.00026, spread_points=25)
+    base = resample_bars(m1, base_min).iloc[:n_base].reset_index(drop=True)
+    end = base["time"].iat[-1] + pd.Timedelta(minutes=base_min)
+    m1 = m1[m1["time"] < end].reset_index(drop=True)
+    ctx = {}
+    for tf in timeframes:
+        ctx[tf] = m1 if tf == "M1" else resample_bars(m1, TIMEFRAME_MINUTES[tf])
+    return base, ctx
+
+
 def synthetic_bars(n: int = 20_000, seed: int = 0, start: str = "2024-01-01", minutes: int = 5,
-                   price: float = 1.10, point: float = 1e-5) -> pd.DataFrame:
+                   price: float = 1.10, point: float = 1e-5, vol: float = 0.00025,
+                   spread_points: float = 8.0) -> pd.DataFrame:
     """Regime-switching random walk (trending / mean-reverting phases, volatility clustering,
     intraday volatility pattern, weekends skipped). Only for testing the pipeline - real markets are
     much harder to predict."""
@@ -76,19 +139,20 @@ def synthetic_bars(n: int = 20_000, seed: int = 0, start: str = "2024-01-01", mi
 
     sub = 6  # sub-steps per bar to build realistic highs and lows
     ret = np.empty(n)
-    vol = 0.00025
+    base_vol = vol
+    regime_scale = np.sqrt(minutes / 5.0)  # keep regime drift comparable across bar sizes
     drift = 0.0
     phi = 0.0
     prev = 0.0
     regime_left = 0
     for k in range(n):
         if regime_left <= 0:
-            regime_left = int(rng.integers(150, 900))
+            regime_left = int(rng.integers(150, 900) * 5 / minutes)
             kind = rng.choice(["trend", "revert", "noise"], p=[0.35, 0.35, 0.30])
-            drift = rng.normal(0, 0.00004) if kind == "trend" else 0.0
+            drift = rng.normal(0, 0.16 * base_vol) * regime_scale ** 2 if kind == "trend" else 0.0
             phi = {"trend": 0.15, "revert": -0.2, "noise": 0.0}[kind]
         regime_left -= 1
-        vol = np.sqrt(0.97 * vol**2 + 0.03 * (0.00025 * rng.lognormal(0, 0.35)) ** 2)
+        vol = np.sqrt(0.97 * vol**2 + 0.03 * (base_vol * rng.lognormal(0, 0.35)) ** 2)
         r = drift + phi * prev + vol * intraday[k] * rng.standard_t(5) / np.sqrt(5 / 3)
         ret[k] = r
         prev = r
@@ -101,7 +165,8 @@ def synthetic_bars(n: int = 20_000, seed: int = 0, start: str = "2024-01-01", mi
     paths[:, -1] = close
     high = np.maximum(paths.max(axis=1), np.maximum(open_, close))
     low = np.minimum(paths.min(axis=1), np.minimum(open_, close))
-    spread = np.clip(np.round(rng.normal(8, 2, n) / intraday), 3, 40)
+    spread = np.clip(np.round(rng.normal(spread_points, spread_points / 4, n) / intraday),
+                     max(1, spread_points / 3), spread_points * 5)
     digits = int(round(-np.log10(point)))
     return pd.DataFrame({
         "time": times.astype("datetime64[ns]"),

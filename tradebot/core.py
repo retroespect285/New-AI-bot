@@ -2,12 +2,13 @@
 
 Each time a bar closes (every 5 minutes on M5) ``BotCore.on_bar`` does:
 
-1. **learn**    - every trade setup whose full outcome window has now passed becomes a training
-                  sample (the model keeps learning from the market, 24/7, not only from its own trades);
+1. **learn**    - every trade setup / direction forecast whose outcome is now known becomes a
+                  training sample (the brain keeps learning from the market, not only its own trades);
 2. **account**  - update equity, daily-loss / drawdown limits and learn from the bot's closed trades;
-3. **manage**   - close positions that hit the max holding time or the Friday cut-off, optional
-                  break-even stop;
-4. **decide**   - score every arm (BUY/SELL x SL/TP profile); pick the best positive-EV arm;
+3. **manage**   - close positions that reached their style's max holding time or the Friday
+                  cut-off, optional break-even stop;
+4. **decide**   - read all charts (M1/M5/M30/H1/H4), score every setup (BUY/SELL x trade style),
+                  pick the best positive-EV one, and update the per-timeframe outlook;
 5. **execute**  - risk checks, position sizing from the stop distance, send the order with SL/TP.
 """
 from __future__ import annotations
@@ -15,23 +16,25 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, Mapping, Optional
 
 import numpy as np
 import pandas as pd
 
 from .brain import Brain, Decision
 from .brokers.base import Broker
-from .config import BotConfig
-from .features import FeatureSet, build_features
+from .config import TIMEFRAME_MINUTES, BotConfig
+from .features import FeatureSet, build_mtf_features
 from .journal import Journal
-from .labels import ArmLabels, label_all, make_arms
+from .labels import ArmLabels, direction_labels, label_all, make_arms
+from .news import NewsCalendar
 from .risk import RiskManager, RiskState
-from .types import Position, Side, SymbolInfo, Tick
+from .types import AccountInfo, Position, Side, SymbolInfo, Tick
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +50,7 @@ class Prepared:
     bars: pd.DataFrame
     features: FeatureSet
     labels: Dict[str, ArmLabels]
+    outlook_labels: Dict[str, np.ndarray]
     times: np.ndarray
 
 
@@ -58,7 +62,9 @@ class BotCore:
         self.journal = journal or Journal(None)
         self.state_dir = Path(state_dir) if state_dir else None
         self.dry_run = dry_run or cfg.trading.dry_run
-        self.arms = make_arms(cfg.model.exit_profiles)
+        self.arms = make_arms(cfg.model.styles)
+        self.arm_by_key = {a.key: a for a in self.arms}
+        self.outlook_horizons = cfg.outlook_horizons()
         self.tf = pd.Timedelta(minutes=cfg.timeframe_minutes)
         self.tf_ns = int(self.tf.value)
         self.infos: Dict[str, SymbolInfo] = {}
@@ -67,6 +73,10 @@ class BotCore:
         self.seen_closed: Deque[int] = deque(maxlen=5000)
         self._seen_set: set = set()
         self.last_sync: Optional[pd.Timestamp] = None
+        self.account_login: Optional[int] = None
+        self._last_backup_day: Optional[str] = None
+        self.news = NewsCalendar.load(cfg.trading.news_file, cfg.trading.news_minutes_before,
+                                      cfg.trading.news_minutes_after)
         self.risk = RiskManager(cfg.risk, self._load_state())
 
     # ------------------------------------------------------------------ setup
@@ -75,16 +85,26 @@ class BotCore:
         self.infos[symbol] = info
         return info
 
-    def prepare(self, symbol: str, bars: pd.DataFrame) -> Prepared:
+    def prepare(self, symbol: str, bars: pd.DataFrame,
+                context: Optional[Mapping[str, pd.DataFrame]] = None) -> Prepared:
+        """Read every chart: ``bars`` is the trading timeframe, ``context`` maps the other
+        timeframes (``model.context_timeframes``) to their bars."""
         info = self.infos[symbol]
-        m, t = self.cfg.model, self.cfg.trading
-        fs = build_features(bars, info.point, m.atr_period)
+        cfg, m, t = self.cfg, self.cfg.model, self.cfg.trading
+        context = dict(context or {})
+        missing = [tf for tf in m.context_timeframes if tf not in context]
+        if missing:
+            raise ValueError(f"{symbol}: bars for context timeframe(s) {missing} are missing")
+        context = {tf: context[tf] for tf in m.context_timeframes}
+        style_tfs = sorted({s.timeframe for s in m.styles})
+        fs = build_mtf_features(bars, context, t.timeframe, TIMEFRAME_MINUTES, info.point, m.atr_period,
+                                required_atr=style_tfs)
         extra_cost = m.slippage_points * info.point
         if t.commission_per_lot > 0:
             extra_cost += t.commission_per_lot / info.value_per_price_unit
-        labels = label_all(bars, fs.atr, self.arms, m.horizon_bars, info.point,
-                           self.cfg.backtest.default_spread_points, extra_cost)
-        return Prepared(bars, fs, labels, to_ns(bars["time"]))
+        labels = label_all(bars, fs.atr_tf, self.arms, info.point, cfg.backtest.default_spread_points, extra_cost)
+        outlook = {tf: direction_labels(bars, h) for tf, h in self.outlook_horizons.items()}
+        return Prepared(bars, fs, labels, outlook, to_ns(bars["time"]))
 
     def brain(self, symbol: str, feature_names) -> Brain:
         if symbol in self.brains:
@@ -94,29 +114,46 @@ class BotCore:
         if path is not None and path.exists():
             try:
                 loaded = Brain.load(path)
-                if loaded.compatible_with(feature_names, self.cfg.model):
+                if loaded.compatible_with(feature_names, self.cfg.model, self.outlook_horizons):
                     loaded.apply_config(self.cfg.model)
                     brain = loaded
-                    log.info("%s: resumed saved model (%d samples learned)", symbol, loaded.n_learned)
+                    log.info("%s: loaded brain from %s (%d samples learned, %d days of history)",
+                             symbol, path, loaded.n_learned, len(loaded.history))
                 else:
-                    log.warning("%s: saved model is incompatible with the current config - starting fresh", symbol)
+                    old = path.with_suffix(".incompatible")
+                    shutil.copy2(path, old)
+                    log.warning("%s: saved brain does not match the current settings (charts / styles / "
+                                "outlooks changed) - kept a copy at %s and starting a new brain", symbol, old)
             except Exception as exc:  # corrupted file etc.
-                log.warning("%s: could not load saved model (%s) - starting fresh", symbol, exc)
+                log.warning("%s: could not load saved brain (%s) - starting a new one", symbol, exc)
         if brain is None:
-            brain = Brain(symbol, feature_names, self.cfg.model, bar_minutes=self.cfg.timeframe_minutes)
+            brain = Brain(symbol, feature_names, self.cfg.model, bar_minutes=self.cfg.timeframe_minutes,
+                          outlook_horizons=self.outlook_horizons)
         self.brains[symbol] = brain
         return brain
 
     def learn(self, symbol: str, prep: Prepared, i: int) -> int:
-        """Learn all samples whose outcome is fully known at the close of bar ``i``."""
+        """Learn everything whose outcome is known once bar ``i`` has closed."""
         fs = prep.features
         brain = self.brain(symbol, fs.names)
-        return brain.learn(fs.X, prep.times, fs.valid, prep.labels, i - self.cfg.model.horizon_bars)
+        return brain.learn(fs.X, prep.times, fs.valid, prep.labels, prep.outlook_labels, i)
 
-    def warmup(self, symbol: str, bars: pd.DataFrame) -> int:
-        prep = self.prepare(symbol, bars)
-        n = self.learn(symbol, prep, len(bars) - 1)
-        log.info("%s: warm-up learned %d new samples from %d bars of history", symbol, n, len(bars))
+    def warmup(self, symbol: str, bars: pd.DataFrame, context: Optional[Mapping[str, pd.DataFrame]] = None,
+               progress: bool = True) -> int:
+        """Study history before trading: replays it day by day exactly as if it were live."""
+        prep = self.prepare(symbol, bars, context)
+        return self.learn_range(symbol, prep, len(bars) - 1, progress)
+
+    def learn_range(self, symbol: str, prep: Prepared, last: int, progress: bool = True) -> int:
+        n = 0
+        step = max(1, int(1440 / self.cfg.timeframe_minutes))  # one day of bars per chunk
+        stops = list(range(min(step, last), last, step)) + [last]
+        report_every = max(1, len(stops) // 10)
+        for k, stop in enumerate(stops, 1):
+            n += self.learn(symbol, prep, stop)
+            if progress and (k % report_every == 0 or k == len(stops)):
+                log.info("%s: studying history... %3.0f%% (%s)", symbol, 100.0 * k / len(stops),
+                         pd.Timestamp(int(prep.times[stop])).strftime("%Y-%m-%d"))
         return n
 
     # ------------------------------------------------------------------ main cycle
@@ -125,15 +162,15 @@ class BotCore:
         i = len(prep.bars) - 1 if i is None else i
         info = self.infos[symbol]
         fs = prep.features
-        bar_time = pd.Timestamp(int(prep.times[i]))
-        bar_close = bar_time + self.tf
+        bar_close = pd.Timestamp(int(prep.times[i])) + self.tf
 
         # 1) learn
         brain = self.brain(symbol, fs.names)
-        brain.learn(fs.X, prep.times, fs.valid, prep.labels, i - cfg.model.horizon_bars)
+        brain.learn(fs.X, prep.times, fs.valid, prep.labels, prep.outlook_labels, i)
 
         # 2) account
         acct = self.broker.account()
+        self.bind_account(acct)
         self.risk.update_equity(acct.equity, bar_close)
         self.sync_closed(bar_close)
 
@@ -149,13 +186,29 @@ class BotCore:
 
         # 5) execute
         if decision.arm is not None:
-            blocked = self._gate(symbol, decision, positions, tick, bar_close, acct.equity)
+            blocked = self._gate(tick, bar_close, acct.equity)
             if blocked:
                 decision.reason = f"blocked: {blocked}"
             else:
-                self._execute(symbol, info, decision, tick, acct.equity, fs.atr[i], bar_close)
+                self._execute(symbol, info, decision, tick, acct.equity, fs.atr_tf[decision.arm.tf][i], bar_close)
         self._journal_decision(symbol, bar_close, decision)
         return decision
+
+    # ------------------------------------------------------------------ account binding
+    def bind_account(self, acct: AccountInfo) -> None:
+        """The risk state (equity peak, daily start, loss streak) belongs to one account. When you
+        move from demo to live, it starts fresh - the learned brain is kept."""
+        if self.account_login == acct.login:
+            return
+        if self.account_login is not None:
+            log.warning("Account changed from %s to %s: starting a fresh risk state (the brain is kept)",
+                        self.account_login, acct.login)
+            self.risk = RiskManager(self.cfg.risk, RiskState())
+            self.open_risk.clear()
+            self.seen_closed.clear()
+            self._seen_set.clear()
+            self.last_sync = None
+        self.account_login = acct.login
 
     # ------------------------------------------------------------------ steps
     def _bars_held(self, pos: Position, prep: Prepared, i: int) -> int:
@@ -163,6 +216,11 @@ class BotCore:
         open_bar = open_ns - (open_ns % self.tf_ns)
         first = int(np.searchsorted(prep.times[: i + 1], open_bar, side="left"))
         return i + 1 - first
+
+    def _max_hold(self, pos: Position) -> int:
+        meta = self.open_risk.get(pos.ticket) or {}
+        arm = self.arm_by_key.get(meta.get("arm", ""))
+        return arm.horizon if arm is not None else self.cfg.model.max_hold
 
     def _friday_cutoff(self, when: pd.Timestamp) -> bool:
         cut = self.cfg.trading.friday_cutoff_hour
@@ -172,7 +230,7 @@ class BotCore:
         cfg = self.cfg
         for pos in positions:
             reason = None
-            if self._bars_held(pos, prep, i) >= cfg.model.horizon_bars:
+            if self._bars_held(pos, prep, i) >= self._max_hold(pos):
                 reason = "time-exit"
             elif self._friday_cutoff(now):
                 reason = "friday-close"
@@ -194,7 +252,7 @@ class BotCore:
                         meta["breakeven"] = True
                     self._event(now, symbol, "breakeven", f"ticket {pos.ticket}: {'ok' if res.ok else res.message}")
 
-    def _gate(self, symbol, decision: Decision, positions, tick: Tick, now: pd.Timestamp, equity: float) -> str:
+    def _gate(self, tick: Tick, now: pd.Timestamp, equity: float) -> str:
         cfg = self.cfg
         ok, why = self.risk.can_trade(equity, now)
         if not ok:
@@ -206,6 +264,9 @@ class BotCore:
             return "friday cut-off"
         if tick.time - now > self.tf * cfg.trading.stale_bar_tolerance:
             return "market data is stale (market closed?)"
+        news = self.news.blocked(now)
+        if news:
+            return f"news blackout ({news})"
         return ""
 
     def _execute(self, symbol: str, info: SymbolInfo, decision: Decision, tick: Tick,
@@ -231,24 +292,26 @@ class BotCore:
         if not ok:
             decision.reason = f"blocked: {why}"
             return
-        row = {"time": now, "symbol": symbol, "side": arm.side.label, "volume": lots, "price": price,
-               "sl": sl, "tp": tp, "risk_money": round(risk_money, 2), "prob": round(decision.prob, 4),
-               "ev_r": round(decision.ev_r, 4), "arm": arm.key}
+        row = {"time": now, "account": self.account_login, "symbol": symbol, "side": arm.side.label,
+               "volume": lots, "price": price, "sl": sl, "tp": tp, "risk_money": round(risk_money, 2),
+               "prob": round(decision.prob, 4), "ev_r": round(decision.ev_r, 4), "arm": arm.key,
+               "outlook": decision.outlook_text()}
         if self.dry_run:
-            log.info("%s DRY-RUN %s %.2f lots @ %s SL %s TP %s (p=%.2f, EV=%+.2fR)", symbol, arm.side.label,
-                     lots, price, sl, tp, decision.prob, decision.ev_r)
+            log.info("%s DRY-RUN %s %.2f lots @ %s SL %s TP %s [%s] (p=%.2f, EV=%+.2fR)", symbol, arm.side.label,
+                     lots, price, sl, tp, arm.key, decision.prob, decision.ev_r)
             self.journal.write("orders", {**row, "status": "dry_run"})
             decision.reason = "dry run"
             return
-        comment = f"ai {arm.side.label[0]} p{decision.prob:.2f}"
+        comment = f"ai {arm.side.label[0]} {arm.tf} p{decision.prob:.2f}"
         res = self.broker.open_position(symbol, arm.side, lots, sl, tp, cfg.trading.magic, comment,
                                         cfg.trading.deviation_points)
         if res.ok:
             if res.ticket is not None:
                 self.open_risk[int(res.ticket)] = {"symbol": symbol, "risk_money": risk_money,
                                                    "sl_dist": sl_dist, "arm": arm.key}
-            log.info("%s OPEN %s %.2f lots @ %s SL %s TP %s (p=%.2f, EV=%+.2fR, risk %.2f)", symbol,
-                     arm.side.label, lots, res.price, sl, tp, decision.prob, decision.ev_r, risk_money)
+            log.info("%s OPEN %s %.2f lots @ %s SL %s TP %s [%s, hold <= %d bars] (p=%.2f, EV=%+.2fR, risk %.2f)",
+                     symbol, arm.side.label, lots, res.price, sl, tp, arm.key, arm.horizon, decision.prob,
+                     decision.ev_r, risk_money)
             decision.reason = "opened"
         else:
             log.warning("%s order rejected: %s", symbol, res.message)
@@ -275,10 +338,11 @@ class BotCore:
             self.risk.record_trade(r, t.time_close)
             if meta and meta.get("arm") and meta.get("symbol") in self.brains:
                 self.brains[meta["symbol"]].record_real_trade(meta["arm"], r)
-            self.journal.write("closed", {"time": t.time_close, "symbol": t.symbol, "ticket": t.position_id,
-                                          "side": t.side.label if t.side else "", "volume": t.volume,
-                                          "price_close": t.price_close, "profit": round(t.profit, 2),
-                                          "r_multiple": round(r, 3), "reason": t.reason})
+            self.journal.write("closed", {"time": t.time_close, "account": self.account_login, "symbol": t.symbol,
+                                          "ticket": t.position_id, "side": t.side.label if t.side else "",
+                                          "volume": t.volume, "price_close": t.price_close,
+                                          "profit": round(t.profit, 2), "r_multiple": round(r, 3),
+                                          "arm": (meta or {}).get("arm", ""), "reason": t.reason})
             log.info("%s CLOSED ticket %s: %+.2f (%+.2fR, %s)", t.symbol, t.position_id, t.profit, r, t.reason)
         self.last_sync = now
 
@@ -288,11 +352,14 @@ class BotCore:
             return
         buy = [e.prob for e in d.evals if e.arm.side is Side.BUY]
         sell = [e.prob for e in d.evals if e.arm.side is Side.SELL]
-        self.journal.write("decisions", {
+        row = {
             "time": now, "symbol": symbol, "action": d.action, "arm": d.arm.key if d.arm else "",
             "prob": round(d.prob, 4), "ev_r": round(d.ev_r, 4), "reason": d.reason,
             "best_buy_p": round(max(buy), 4) if buy else "", "best_sell_p": round(max(sell), 4) if sell else "",
-        })
+        }
+        for tf, p in d.outlook.items():
+            row[f"up_{tf}"] = round(p, 4)
+        self.journal.write("decisions", row)
 
     def _event(self, now, symbol, event, detail) -> None:
         log.info("%s %s: %s", symbol, event, detail)
@@ -316,6 +383,7 @@ class BotCore:
         except (OSError, ValueError) as exc:
             log.warning("Could not read %s (%s); starting with a clean risk state", path, exc)
             return None
+        self.account_login = data.get("account")
         self.open_risk = {int(k): v for k, v in data.get("open_risk", {}).items()}
         for pid in data.get("seen_closed", []):
             self.seen_closed.append(int(pid))
@@ -325,14 +393,18 @@ class BotCore:
         return RiskState.from_dict(data.get("risk", {}))
 
     def save_state(self, models: bool = True) -> None:
-        """Persist the risk state (small) and, if ``models``, the learned models (larger)."""
+        """Persist the risk state (small) and, if ``models``, the brains (larger). Once a day a
+        dated copy of each brain is kept in ``state/backups`` so a good brain can be restored."""
         if self.state_dir is None:
             return
         self.state_dir.mkdir(parents=True, exist_ok=True)
         if models:
             for symbol, brain in self.brains.items():
-                brain.save(self._brain_path(symbol))
+                path = self._brain_path(symbol)
+                brain.save(path)
+                self._backup(path, brain)
         data = {
+            "account": self.account_login,
             "risk": self.risk.state.to_dict(),
             "open_risk": {str(k): v for k, v in self.open_risk.items()},
             "seen_closed": list(self.seen_closed)[-1000:],
@@ -343,3 +415,18 @@ class BotCore:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, default=str)
         os.replace(tmp, path)
+
+    def _backup(self, path: Path, brain: Brain) -> None:
+        keep = self.cfg.model.backup_days
+        day = brain._day
+        if keep <= 0 or not day:
+            return
+        backups = self.state_dir / "backups"
+        target = backups / f"{path.stem}_{day}{path.suffix}"
+        if target.exists():
+            return
+        backups.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        olds = sorted(backups.glob(f"{path.stem}_*{path.suffix}"))
+        for old in olds[:-keep]:
+            old.unlink()

@@ -1,96 +1,128 @@
-# New-AI-bot: a self-learning MT5 trading bot
+# New-AI-bot: a self-learning gold (XAUUSD) trading bot for MT5
 
-An automated day-trading bot for **MetaTrader 5**. Every time a candle closes (every 5 minutes on
-M5) it reads the chart, decides whether to **BUY**, **SELL** or stay out, and picks its own
-**stop-loss** and **take-profit**. It keeps learning from the market around the clock and adapts
-when conditions change.
+An automated day-trading bot for **MetaTrader 5**, set up for **gold**. Every 5 minutes it reads
+the gold chart on **five timeframes at once (M1, M5, M30, H1, H4)**, forecasts where price is
+heading on each of them, decides whether to **BUY**, **SELL** or stay out, and picks its own
+**stop-loss**, **take-profit** and holding time. Everything it learns is stored in a **brain file**
+that grows every 5 minutes and is reloaded after every restart.
 
 > **Read this first.** This is software, not a money machine. Most automated strategies lose money
 > once spreads and commissions are paid, and nothing here guarantees a profit. The bot is built to
-> be honest with itself: it only trades setups it has *proven* on recent out-of-sample data. It
-> will often sit on its hands for days, and on some markets it may never find an edge. Always
-> backtest on your broker's data, then run it on a **demo account** for weeks before you even
-> consider real money. Never risk money you can't afford to lose.
+> be honest with itself: it only trades setups it has *proven* on recent out-of-sample data, so it
+> will often sit on its hands, and on some periods it may find no edge at all. Backtest on your
+> broker's data, then run it on a **demo account for weeks** (see [Demo → live](#demo--live)).
+> Never risk money you can't afford to lose.
 
 ---
 
-## What it does each bar
+## What it does every 5 minutes
 
 ```
- new M5 candle closes
+ new M5 gold candle closes
         │
         ▼
- 1. LEARN    trade setups from 2 hours ago now have a known outcome → they become training data
- 2. ACCOUNT  update equity, daily-loss / drawdown limits, learn from the bot's own closed trades
- 3. MANAGE   close positions held too long (2h) or before the weekend, optional break-even stop
- 4. DECIDE   score every setup: BUY/SELL × 3 stop-loss/take-profit sizes → expected value
- 5. EXECUTE  risk checks → lot size from stop distance → market order with SL and TP attached
+ 1. READ     M1 + M5 + M30 + H1 + H4 charts → ~150 indicators and candle patterns
+ 2. LEARN    every forecast whose answer is now known is scored and learned from (brain file grows)
+ 3. ACCOUNT  equity, daily-loss / drawdown limits, results of the bot's own closed trades
+ 4. MANAGE   close positions that reached their max holding time or the Friday cut-off
+ 5. FORECAST direction outlook for 5 min / 30 min / 1 h / 4 h
+ 6. DECIDE   score 8 setups: BUY/SELL × 4 trade styles (M5 scalp ... H4 day trade) → expected value
+ 7. EXECUTE  risk checks → lot size from stop distance → market order with SL and TP attached
 ```
 
-### 1. Reading the chart
-`tradebot/features.py` turns raw candles into ~58 indicators that describe the chart the way a
-trader would. All of them are scaled by ATR, so they mean the same thing in quiet and in wild markets:
+### 1. Reading every timeframe
+`tradebot/features.py`. Every indicator is scaled by ATR, so it means the same thing in quiet
+and in wild markets.
 
-* **trend**: distance from EMA 9/21/50/100/200, EMA crosses and slopes, ADX, +DI/−DI
-* **momentum**: price change over 1–48 bars, RSI 7/14, MACD, stochastic
-* **volatility**: ATR regime, Bollinger position and width, candle range
-* **support/resistance**: position inside the 20/50/100-bar channel, distance to recent highs and lows
-* **candlestick patterns**: body and wicks, engulfing, hammer, shooting star, doji, inside/outside bars, streaks
-* **context**: tick volume, spread, hour of day, day of week
+| chart | what the bot sees there |
+|---|---|
+| **M5** (the chart it trades) | ~58 indicators: EMA 9–200 distances/slopes/crosses, RSI, MACD, stochastic, ADX, Bollinger bands, 20/50/100-bar support & resistance, momentum over 5 min – 4 h, candle anatomy, engulfing / hammer / shooting star / doji / inside / outside bars, streaks, tick volume, spread, hour of day, weekday |
+| **M1** | the small movements *inside* each 5-minute candle: 1-minute momentum, RSI, MACD, wicks, streaks |
+| **M30, H1, H4** | the bigger picture: trend (EMA 20/50), momentum, RSI, MACD, ADX, Bollinger position, channel position, last candle's shape and engulfing |
+| **M30, H1, H4 still forming** | the candle that hasn't closed yet, rebuilt from M5: "the current H1 candle is up 0.8 ATR, near its high, 40 min old" |
 
-A feature at bar *i* only uses bars up to *i* (no peeking at the future). The tests check this.
+A higher-timeframe candle is only used **after it has closed**, exactly as you would see it live,
+so no indicator ever peeks at the future. The tests check this on all charts.
 
-### 2. Choosing direction, stop-loss and take-profit
-The bot thinks in **setups** ("arms"): `BUY` or `SELL` combined with a stop-loss/take-profit pair
-measured in ATR. The defaults are `1.0/1.5`, `1.5/2.5` and `2.0/4.0` ATR, which makes 6 setups.
-For each one it estimates:
+### 2. Predictions on each timeframe
+**Direction outlook.** Every 5 minutes the brain forecasts whether gold will be higher in
+**5 minutes, 30 minutes, 1 hour and 4 hours**. Each forecast is scored when the answer is known,
+which gives a running accuracy per timeframe: the brain's report card. You see it in the log
+(`outlook M5:UP54% M30:DN52% H1:UP58% H4:UP61%`), in `logs/decisions.csv`, and in `status`.
 
-* `P(TP)`: the chance the take-profit is hit first
-* `P(SL)`: the chance the stop-loss is hit first (if neither is hit, the trade times out after 2 hours)
-* **Expected value** in R (1R = the money risked):
-  `EV = P(TP)·avgWin + P(SL)·avgLoss + P(timeout)·avgTimeout`, with the averages measured from the
-  market itself, spread and costs included
+**Trade styles.** The bot chooses between four ways of trading, each sized by the ATR of its own
+chart (all configurable):
 
-It takes the setup with the highest EV, but only if all of these hold:
-1. The model has **skill**: its out-of-sample forecasts beat simply guessing the base rate.
-2. **EV ≥ 0.10R** after costs.
-3. The setup's **paper-trading record** is good: every signal is also traded on paper in the
-   background, and real orders are only allowed while its last 40 trades (paper and real) are
-   profitable on average, with a t-statistic of at least 1.5.
+| style | stop-loss | take-profit | max hold | example stop (varies with volatility) |
+|---|---|---|---|---|
+| M5 scalp | 1.5 × ATR(M5) | 2.0 × ATR(M5) | 1 hour | $3–5 stop |
+| M30 intraday | 1.0 × ATR(M30) | 1.5 × ATR(M30) | 4 hours | $5–8 stop |
+| H1 intraday swing | 1.0 × ATR(H1) | 2.0 × ATR(H1) | 8 hours | $8–12 stop |
+| H4 day trade | 1.0 × ATR(H4) | 1.5 × ATR(H4) | 24 hours | $15–25 stop |
 
-SL and TP are sent with the order, so they sit on the broker's server. If your PC or internet
-dies, the position is still protected.
+Each style can be a BUY or a SELL, which gives 8 setups. For each setup the brain estimates
+`P(take-profit first)` and `P(stop-loss first)`, then the **expected value** in R (1R = the money
+risked): `EV = P(TP)·avgWin + P(SL)·avgLoss + P(timeout)·avgTimeout`, with spread and costs included.
+It takes the best setup only if all of these hold:
+1. its forecasts have **skill**: they beat simply guessing the base rate, out of sample;
+2. **EV ≥ 0.10R** after costs;
+3. its **paper-trading record** is good: every signal is also traded on paper, and real orders are
+   only allowed while its last 40 trades (paper and real) are profitable on average with a
+   t-statistic of at least 1.5.
 
-### 3. Learning and adapting
-`tradebot/learner.py` and `tradebot/brain.py`. Each setup has two forecasting models, and each
-model blends three "experts":
+M1 is used for *reading* only. Trades sized on 1-minute candles would have stops of ~$1, where a
+$0.25–0.40 gold spread eats a third of every trade.
+
+### 3. The brain: how it gets smarter
+`tradebot/learner.py`, `tradebot/brain.py`. Each setup and each outlook has its own learner that
+blends three "experts":
 
 | expert | what it is | how it adapts |
 |---|---|---|
 | base rate | recent frequency of the outcome | moving average |
 | online logistic regression | linear patterns | updated after **every** new sample |
-| gradient-boosted trees | non-linear patterns (e.g. "breakout + high volume + London open") | re-trained **daily** on the most recent ~10 days |
+| gradient-boosted trees | non-linear patterns across charts (e.g. "H4 uptrend + H1 pullback + M5 hammer") | re-trained **daily** on the most recent ~10 days |
 
-The experts are blended with **Hedge weights** based on each one's recent out-of-sample accuracy.
-Whichever is reading the current market best gets the most say. When a pattern stops working, its
-accuracy drops, its weight shrinks, the skill score falls, the paper record turns negative, and the
-bot stops trading that setup until it works again.
+The experts are weighted by their recent out-of-sample accuracy, so whichever is reading the
+current market best gets the most say. When a pattern stops working, its weight shrinks, the skill
+score drops and the paper record turns negative, and the bot stops trading that setup until it
+works again.
 
-It learns from **every bar** (would a trade opened here have worked?), not only from its own
-trades, so it gathers ~288 lessons per day per setup on M5. Models are saved to `state/` and
-picked up again after a restart.
+**It learns from every candle, not just its own trades.** Every 5 minutes, all 8 setups and 4
+outlooks whose outcome has become known are scored and learned. That's thousands of lessons per
+day, demo or live.
+
+**The brain file** `state/brain_XAUUSD_M5.joblib` holds everything learned: the models, the expert
+weights, the average win/loss of every setup, the paper-trading records, the per-timeframe accuracy,
+and a **day-by-day learning history**. It is:
+* created on the first start by **studying ~70 days of history** on all five charts (a few
+  minutes), replayed candle by candle exactly as if it were live;
+* updated every 5 minutes, saved every hour and on exit, and reloaded on restart;
+* backed up once a day to `state/backups/` (last 7 days kept), so a good brain can be restored.
+
+`python -m tradebot status` shows what is in the brain and whether it is getting smarter:
+
+```
+Is it getting smarter? (one row per day; accuracy = recent direction hit rate, best skill = best setup's edge over guessing)
+  date            M5    M30     H1     H4   best skill   paper trades
+  2026-11-02   50.2%  51.0%  52.4%  53.1%       +0.012            118
+  2026-11-03   50.8%  51.6%  53.0%  54.0%       +0.019            131
+```
+(Illustrative numbers. On real gold, direction accuracy a few points above 50% is already good,
+and anyone promising 70–80% is not being honest.)
 
 ### 4. Risk management (`tradebot/risk.py`)
 * **Position size from the stop distance**: each trade risks `risk_per_trade_pct` (default 0.5%)
-  of equity, using the broker's exact tick value and lot step.
+  of equity, using the broker's exact gold contract size, tick value and lot step.
 * **Adaptive risk**: after a run of losses the risk per trade shrinks (down to 25%) and recovers as results improve.
-* **Daily loss limit** (3%): no new trades for the rest of the server day.
-* **Drawdown kill switch** (15% from the equity peak): trading stops until you reset it by hand.
-* **Cool-down** after 4 losses in a row (60 min).
-* Spread filter, broker minimum stop distance, max positions per symbol and in total, session
-  hours, **Friday cut-off** (flat before the weekend), stale-data guard.
-* **Real-money guard**: the bot refuses to trade a real account unless you set `mt5.allow_live_account: true`.
-* `magic` number: the bot only ever touches its own trades, never your manual ones.
+* **Daily loss limit** (3%), **drawdown kill switch** (15% from the equity peak), **cool-down**
+  after 4 losses in a row.
+* Spread filter, broker minimum stop distance, one position at a time, trading session (default
+  01:00–23:00 server time, which skips gold's spread spike at the daily roll-over), **Friday
+  cut-off** (flat before the weekend), stale-data guard.
+* **News blackout** (optional): no new trades around NFP / CPI / FOMC (see below).
+* **Real-money guard**: the bot refuses a real account unless `mt5.allow_live_account: true`.
+* It only ever touches its own trades (`magic` number), never your manual ones.
 
 ---
 
@@ -99,12 +131,14 @@ picked up again after a restart.
 The official `MetaTrader5` Python package only runs on **Windows**, on the same PC (or Windows
 VPS) as the MT5 terminal.
 
-1. Install **MetaTrader 5** from your broker and log in. Open a **demo account** first.
+1. Install **MetaTrader 5** from your broker and log in to a **demo account**.
 2. In MT5: **Tools → Options → Expert Advisors → tick "Allow algorithmic trading"**, and make sure
    the **Algo Trading** button in the toolbar is green.
-3. In MT5: **Tools → Options → Charts → Max bars in chart → Unlimited** (the bot needs history to learn).
-4. Install **Python 3.10–3.13** from python.org (tick *"Add Python to PATH"*).
-5. Get this project and run the one-time setup:
+3. In MT5: **Tools → Options → Charts → Max bars in chart → Unlimited** (the bot studies history).
+4. Show gold in **Market Watch** (right-click → Symbols → search "XAU" or "GOLD"). Note its exact
+   name: `XAUUSD`, `GOLD`, `XAUUSD.m`, `XAUUSDm`...
+5. Install **Python 3.10–3.13** from python.org (tick *"Add Python to PATH"*).
+6. Get this project and run the one-time setup:
    ```bat
    git clone https://github.com/retroespect285/New-AI-bot.git
    cd New-AI-bot
@@ -112,127 +146,156 @@ VPS) as the MT5 terminal.
    ```
    (Or by hand: `python -m venv .venv`, `.venv\Scripts\activate`, `pip install -r requirements.txt`,
    `copy config.example.yaml config.yaml`.)
-6. Edit `config.yaml`: at least `trading.symbols`, using the exact names from MT5's Market Watch
-   (some brokers use suffixes like `EURUSD.m`). If you want the bot to log in by itself, copy
-   `.env.example` to `.env` and fill in `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`. Otherwise it
-   uses whatever account the terminal is logged in to.
+7. Edit `config.yaml`: set `trading.symbols` to your broker's gold name. If you want the bot to log
+   in by itself, copy `.env.example` to `.env` and fill in `MT5_LOGIN`, `MT5_PASSWORD`,
+   `MT5_SERVER`. Otherwise it uses whatever account the terminal is logged in to.
 
 ## Usage
 
 Run commands from the project folder with the virtual environment active (`.venv\Scripts\activate`).
 
-### Step 1: check the connection
-```bat
-python -m tradebot check
-```
-This prints your account (DEMO/REAL), each symbol's contract spec, the spread and how much history is available.
+| step | command | what it does |
+|---|---|---|
+| 1 | `python -m tradebot check` | tests the connection; shows account (DEMO/REAL), gold spec, spread, and how much M1/M5/M30/H1/H4 history MT5 has |
+| 2 | `python -m tradebot export --days 180` | downloads all five charts to `data\XAUUSD_M1.csv` ... `data\XAUUSD_H4.csv` |
+| 3 | `python -m tradebot backtest --csv data\XAUUSD_M5.csv` | walk-forward backtest (reads the other four files from the same folder) |
+| 4 | `python -m tradebot live --dry-run` | studies history, then follows the live market and logs decisions, **no orders** |
+| 5 | `python -m tradebot live` (or `scripts\run_bot.bat`) | trades the demo account. Ctrl+C stops it cleanly |
+| – | `python -m tradebot status` | what the brain has learned, day by day |
+| – | `python -m tradebot readiness` | does the demo record justify real money? |
 
-### Step 2: backtest on your broker's data
-```bat
-python -m tradebot export --bars 100000
-python -m tradebot backtest --csv data\EURUSD_M5.csv
-```
-The backtest is **walk-forward**. The model starts from zero, learns from the first 6,000 bars
-without trading, then trades and keeps learning bar by bar, exactly as it would live (it runs the
-same code). Output in `backtests\EURUSD_M5\`: `summary.json`, `equity.csv` (+ `equity.png` if
-matplotlib is installed), `orders.csv`, `closed.csv`, `decisions.csv` (why it did or didn't trade
-on every bar).
-
-You can also use a file from MT5's own *View → Symbols → Bars → Export*. Without `--csv` it
-runs on synthetic data, which only checks that everything works and says nothing about real markets.
-
-### Step 3: dry run on live data
-```bat
-python -m tradebot live --dry-run
-```
-Learns from history, then follows the live market and **logs** what it would do without sending orders.
-
-### Step 4: demo trading
-```bat
-python -m tradebot live          (or double-click scripts\run_bot.bat)
-```
-Keep the window open; **Ctrl+C** stops it cleanly. The first start learns from ~70 days of
-history, which takes a few minutes. Later starts resume from `state/`. Let it run on demo for
-several weeks and compare with the backtest.
-
-### Inspecting what it learned
-```bat
-python -m tradebot status
-```
-Per setup this shows: samples learned, skill vs. the base rate, expert weights, and the paper-trading record.
+**Backtest.** The model starts from zero, learns from the first 6,000 candles without trading, then
+trades and keeps learning candle by candle, exactly as it would live (same code). Output in
+`backtests\XAUUSD_M5\`: `summary.json`, `equity.csv` (+ `equity.png` if matplotlib is installed),
+`orders.csv`, `closed.csv`, `decisions.csv` (why it did or didn't trade on every candle, with the
+outlook per timeframe). Without `--csv` it runs on synthetic gold-like data, which only checks
+that everything works.
 
 ### Files it writes
 | path | contents |
 |---|---|
+| `state/brain_XAUUSD_M5.joblib` | **the brain** (everything learned) |
+| `state/backups/` | one brain copy per day, last 7 days |
+| `state/bot_state.json` | risk state of the current account (delete it to reset the kill switch) |
 | `logs/bot.log` | everything that happened (rotating) |
-| `logs/decisions.csv` | every bar: action, probability, EV, reason |
-| `logs/orders.csv` | every order sent (or `dry_run`) with SL/TP, lots and money at risk |
-| `logs/closed.csv` | every closed trade with profit and result in R |
+| `logs/decisions.csv` | every 5 minutes: action, setup, probability, EV, reason, `up_M5`…`up_H4` outlook |
+| `logs/orders.csv` | every order sent (or `dry_run`) with SL/TP, lots, money at risk, setup, account |
+| `logs/closed.csv` | every closed trade: profit, result in R, setup, account |
 | `logs/events.csv` | time exits, Friday closes, break-even moves |
-| `state/` | saved models and risk state (delete `bot_state.json` to reset the kill switch) |
 
-## Configuration highlights (`config.yaml`)
-| setting | default | meaning |
-|---|---|---|
-| `trading.symbols` | `[EURUSD]` | one model per symbol |
-| `trading.timeframe` | `M5` | acts once per closed candle |
-| `trading.commission_per_lot` | `0` | set it if your account charges commission (e.g. 7.0), so learning includes it |
-| `model.exit_profiles` | 1/1.5, 1.5/2.5, 2/4 ATR | candidate stop-loss/take-profit sizes the bot chooses from |
-| `model.horizon_bars` | `24` | max holding time (2 h on M5) |
-| `model.min_ev_r` | `0.10` | minimum expected value per trade after costs |
-| `risk.risk_per_trade_pct` | `0.5` | % of equity lost when a stop is hit |
-| `risk.max_daily_loss_pct` | `3` | daily circuit breaker |
-| `risk.max_drawdown_pct` | `15` | kill switch |
-| `mt5.allow_live_account` | `false` | must be `true` to trade real money |
+### News blackout (recommended for gold)
+Create e.g. `data\news.csv` with times in your **broker's server time**, and set
+`trading.news_file: data/news.csv`:
+```
+time,title,minutes_before,minutes_after
+2026-12-05 15:30,US Non-Farm Payrolls,30,30
+2026-12-10 15:30,US CPI,,
+2026-12-16 21:00,FOMC rate decision,30,60
+```
+No new trades are opened inside those windows (blank = the default 15 minutes).
 
-See `config.example.yaml` for every option.
+---
+
+## Demo → live
+
+**How long on demo?** The brain does *not* learn faster on demo than live, or the other way
+round. It learns from gold prices, which are the same on both. On the first start it already
+studies ~70 days of history, far more than one day of demo trading adds. What the demo period has to
+prove is that the **whole system makes money**: signals, spreads, fills, your broker, your PC.
+That needs **enough trades to tell skill from luck**. One day gives a handful of trades, and a
+handful of trades says almost nothing: a coin flip wins 5 in a row about 3% of the time.
+
+So the bot includes a check instead of a calendar:
+
+```bat
+python -m tradebot readiness
+```
+```
+Live-trading readiness (based on this bot's demo trades):
+  [OK] time on demo: 16.2 days (need 14)
+  [  ] number of trades: 21 (need 30)
+  [OK] profit factor: 1.41 (need 1.2)
+  [OK] average result: +0.18R per trade (need >= +0.00R)
+  [OK] worst drawdown: 4.0R ~ 2.0% of equity (limit 10.0%)
+NOT READY yet - keep it on demo. Going live now would be betting on luck.
+```
+The thresholds are in `readiness:` in `config.yaml`. When you do switch:
+1. Log the MT5 terminal into the live account (check the gold symbol name is the same; if not,
+   rename `state/brain_<old name>_M5.joblib` to the new name so the brain carries over).
+2. Set `mt5.allow_live_account: true`, and consider a smaller `risk.risk_per_trade_pct` (e.g. 0.25) at first.
+3. Start it. The **brain carries over**; the **risk state starts fresh** for the new account,
+   because the demo's equity peak must not trigger the live kill switch. On a real account the
+   readiness report is printed at start-up.
 
 ## Running it 24/5
 * Run it on a **Windows VPS** close to your broker's server, so it doesn't depend on your home PC.
 * Use `scripts\run_bot.bat` with Windows Task Scheduler ("At log on") to restart after reboots. It
-  resumes from `state/`, and SL/TP stay on the server in the meantime.
-* Check `logs/bot.log` and `logs/closed.csv` regularly. The `status` command shows whether the
-  model still has an edge.
+  resumes from the brain file, and SL/TP stay on the broker's server in the meantime.
+* Check `logs/bot.log`, `logs/closed.csv` and `python -m tradebot status` regularly.
 
 ## How do I know it isn't fooling itself?
 The most common way trading bots go wrong is "learning" patterns that aren't really there.
 Safeguards built in:
-* **Walk-forward only.** The model is scored on forecasts made *before* each outcome was known,
-  exactly as in live trading. A test checks that every backtest decision is identical whether or
-  not future bars exist in the data.
-* **Random-walk check.** On pure random-walk prices (where no strategy can win), the bot should
-  not trade. During development, an early version lost 15% on a random walk; that led to the
-  stop-loss probability model and the paper-trading gate. With the current defaults it made
-  **0 trades on 4 different random walks**. On synthetic data that does contain trends and
-  mean-reversion, it traded selectively (for example 53 trades, profit factor 2.0, max drawdown
-  4.3% on one series) and stayed out of others where it couldn't confirm an edge.
+* **Walk-forward only.** Every forecast is scored on data it had never seen, made at the moment it
+  would have been made live. Tests check that every backtest decision is identical whether or not
+  future candles exist in the data, on all five charts.
+* **Random-walk check.** On pure random-walk prices, where no strategy can win, the bot should not
+  trade. During development an early version lost 15% on a random walk; that led to the stop-loss
+  model and the paper-trading gate. See *Validation* below for the current results.
 * These checks only show that the machinery is honest. **Only a backtest on your broker's real
-  data, followed by weeks on demo, tells you whether it has an edge on your market.**
+  gold data, followed by weeks on demo, tells you whether it has an edge.**
+
+## Validation
+Results of the honesty checks on the default gold settings (14,000 M5 candles each, with M1/M30/H1/H4):
+
+| data | what it should do | result |
+|---|---|---|
+| random-walk gold prices (4 seeds) | not trade (nothing to find) | see the commit / PR for the latest run |
+| synthetic gold with trends & mean reversion (3 seeds) | find something, or stay out | see the commit / PR for the latest run |
 
 ## Limitations (please read)
 * **No edge is guaranteed.** The bot is designed to recognise when it has none and then stay out,
   which can mean long stretches without trades.
-* Spreads and commissions are a big hurdle on M5. A 1-pip spread against a 5-pip stop costs 0.2R
-  per trade before anything else. Low-spread symbols and accounts matter a lot.
-* The backtest works from candles: inside a candle it assumes the worst (stop before target),
-  and it can't simulate slippage, requotes or news spikes exactly.
-* It knows nothing about news or economic releases. Consider widening `session` or pausing it around major events.
-* One model per symbol and timeframe; positions are capped at one per symbol.
+* Gold spreads and sudden spikes are expensive. Low-spread accounts matter a lot.
+* The backtest works from 5-minute candles: inside a candle it assumes the worst (stop before
+  target), and it can't simulate slippage, requotes or news spikes exactly.
+* News is only handled through the blackout file you maintain.
+* One position at a time per symbol; one brain per symbol and trading timeframe.
+
+## Configuration highlights (`config.yaml`)
+| setting | default | meaning |
+|---|---|---|
+| `trading.symbols` | `[XAUUSD]` | your broker's gold symbol name |
+| `trading.timeframe` | `M5` | decides once per closed 5-minute candle |
+| `model.context_timeframes` | `[M1, M30, H1, H4]` | other charts it reads |
+| `model.outlooks` | `[M5, M30, H1, H4]` | direction forecasts it makes and scores |
+| `model.styles` | 4 styles (table above) | stop / target / hold choices |
+| `model.min_ev_r` | `0.10` | minimum expected value per trade after costs |
+| `risk.risk_per_trade_pct` | `0.5` | % of equity lost when a stop is hit |
+| `risk.max_daily_loss_pct` | `3` | daily circuit breaker |
+| `risk.max_drawdown_pct` | `15` | kill switch |
+| `trading.news_file` | none | news blackout CSV |
+| `mt5.allow_live_account` | `false` | must be `true` to trade real money |
+
+See `config.example.yaml` for every option.
 
 ## Project layout
 ```
 tradebot/
-  features.py    chart → indicators / candlestick patterns
-  labels.py      what would a trade opened at each bar have done (TP / SL / timeout, in R)
-  learner.py     self-adapting probability model (base rate + online logistic + boosted trees, Hedge-blended)
-  brain.py       per-symbol decision maker: setups, EV, skill gate, paper-trading gate
+  features.py    5 charts → ~150 indicators / candle patterns, aligned without look-ahead
+  labels.py      what would each setup have done (TP / SL / timeout, in R); direction outcomes
+  learner.py     self-adapting probability model (base rate + online logistic + boosted trees)
+  brain.py       per-symbol brain: setups, outlooks, EV, skill and paper-trading gates, history
   risk.py        sizing, loss limits, kill switch, adaptive risk
-  core.py        the per-bar cycle shared by live trading and backtests
-  engine.py      live loop (waits for each new candle on MT5)
+  core.py        the 5-minute cycle shared by live trading and backtests
+  engine.py      live loop (waits for each new candle on MT5, fetches all charts)
   backtest.py    walk-forward backtester + statistics
+  readiness.py   demo → live readiness report
+  news.py        news blackout calendar
+  data.py        CSV import/export, resampling, synthetic gold market
   brokers/mt5.py MetaTrader 5 connector (orders, positions, history, filling-mode fallback, reconnect)
-  brokers/sim.py bar-replay simulator used by the backtester
-  cli.py         command line (check / live / backtest / export / status)
+  brokers/sim.py candle-replay simulator used by the backtester
+  cli.py         command line (check / live / backtest / export / status / readiness)
 tests/           unit + integration tests (including "no look-ahead" checks and a fake MT5)
 ```
 
