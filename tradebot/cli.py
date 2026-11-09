@@ -83,6 +83,8 @@ def _symbol_report(cfg: BotConfig, broker, symbol: str, acct) -> str:
     tick = broker.get_tick(symbol)
     print(f"{symbol}: bid {tick.bid} ask {tick.ask} spread {tick.spread / info.point:.0f} points | "
           f"spec {info.to_dict()}")
+    print(f"  value: {info.volume_min:g} lot gains/loses {info.value_per_price_unit * info.volume_min:,.2f} "
+          f"{acct.currency} per 1.00 move in price (checked with MT5's profit calculator)")
     by_tf = {}
     for tf in [cfg.trading.timeframe] + cfg.model.context_timeframes:
         want = (cfg.trading.warmup_bars if tf == cfg.trading.timeframe
@@ -237,12 +239,15 @@ def cmd_setup(cfg: BotConfig, args) -> int:
 
         print("\nChecking what this account can trade ...")
         report = _symbol_report(new_cfg, broker, symbol, acct)
-        print("\nAll set. Next:")
-        print("  - 3-TEST-WITHOUT-TRADING.bat : watch the bot think for a few candles, no orders")
-        print("  - 4-START-TRADING.bat        : start trading" +
-              (" (allowed on this real account)" if not acct.is_demo and allow_live else ""))
         if "WILL NOT" in report:
-            print("  ! With these settings the bot cannot open trades on this account (see 'Account fit' above).")
+            print("\nSettings saved, but this account is too small for the bot to open trades (see 'Account fit').")
+            print("  - 3-TEST-WITHOUT-TRADING.bat still works: the bot learns and shows what it would do.")
+            print("  - To trade for real: use a CENT account (then run this set-up again) or add funds.")
+        else:
+            print("\nAll set. Next:")
+            print("  - 3-TEST-WITHOUT-TRADING.bat : watch the bot think for a few candles, no orders")
+            print("  - 4-START-TRADING.bat        : start trading" +
+                  (" (allowed on this real account)" if not acct.is_demo and allow_live else ""))
     finally:
         broker.shutdown()
     return 0

@@ -88,3 +88,17 @@ def test_closed_trades_aggregate_deals(broker):
     t = trades[0]
     assert t.position_id == 555 and t.side is Side.BUY and t.reason == "tp"
     assert t.profit == pytest.approx(27.5)  # profit + commissions + swap
+
+
+def test_wrong_tick_value_is_corrected_by_the_profit_calculator(broker, caplog):
+    # e.g. a gold symbol advertising tick value 10.0 while real P/L is 1.0 per tick
+    fake_mt5.state.tick_value = 10.0
+    info = broker.symbol_info("EURUSD")
+    assert info.tick_value == pytest.approx(1.0)
+    assert info.value_per_price_unit == pytest.approx(100000.0)
+    assert "profit calculator" in caplog.text
+
+
+def test_correct_tick_value_is_kept(broker):
+    fake_mt5.state.tick_value = 1.0
+    assert broker.symbol_info("EURUSD").tick_value == 1.0

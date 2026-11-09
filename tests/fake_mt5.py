@@ -55,6 +55,8 @@ class State:
         self.filling_mode = SYMBOL_FILLING_FOK | SYMBOL_FILLING_IOC
         self.now = 1_700_000_100  # open time of the M5 bar that is currently forming
         self.margin_per_lot = 220.0
+        self.tick_value = 1.0  # what symbol_info reports
+        self.profit_per_unit = 100000.0  # what the profit calculator really pays per 1.0 move per lot
         self.symbols = [SymT("EURUSD", "Euro vs US Dollar"), SymT("XAUUSD", "Gold vs US Dollar"),
                         SymT("XAUUSDc", "Gold vs US Dollar (cent)"), SymT("US30", "Dow Jones")]
         self.init_ok = True
@@ -98,7 +100,12 @@ def symbol_select(symbol, enable):
 
 
 def symbol_info(symbol):
-    return SymInfo(1e-5, 5, 1e-5, 1.0, 100000.0, 0.01, 50.0, 0.01, 10, 0, state.filling_mode)
+    return SymInfo(1e-5, 5, 1e-5, state.tick_value, 100000.0, 0.01, 50.0, 0.01, 10, 0, state.filling_mode)
+
+
+def order_calc_profit(action, symbol, volume, price_open, price_close):
+    sign = 1 if action == ORDER_TYPE_BUY else -1
+    return sign * (price_close - price_open) * state.profit_per_unit * volume
 
 
 def symbol_info_tick(symbol):

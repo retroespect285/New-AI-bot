@@ -84,6 +84,7 @@ class MT5Broker(Broker):
         self.cfg = cfg
         self._mt5 = module
         self._info_cache: Dict[str, SymbolInfo] = {}
+        self._value_warned: set = set()
         self._filling_cache: Dict[str, List[int]] = {}
 
     # ------------------------------------------------------------------ helpers
@@ -169,12 +170,27 @@ class MT5Broker(Broker):
         si = self.mt5.symbol_info(symbol)
         if si is None:
             raise BrokerError(f"symbol_info({symbol}) failed: {self._err()}")
+        tick_size = float(si.trade_tick_size or si.point)
+        tick_value = float(si.trade_tick_value)
+        # Some brokers publish a tick value that doesn't match how they actually calculate profit
+        # (e.g. gold: 10.0 per 0.01 with a 100 oz contract, where real P/L is 1.0). MT5's own profit
+        # calculator is the authority, so cross-check and use it when they disagree.
+        calc = self._value_per_price_unit(symbol, si)
+        if calc is not None:
+            reported = tick_value / tick_size if tick_size > 0 else 0.0
+            if reported <= 0 or abs(calc - reported) / calc > 0.02:
+                if reported > 0 and symbol not in self._value_warned:
+                    log.warning("%s: MT5 reports a tick value of %g per %g, but MT5's profit calculator says "
+                                "1 lot gains/loses %.2f per 1.0 move in price; using the profit calculator.",
+                                symbol, tick_value, tick_size, calc)
+                    self._value_warned.add(symbol)
+                tick_value = calc * tick_size
         info = SymbolInfo(
             name=symbol,
             point=float(si.point),
             digits=int(si.digits),
-            tick_size=float(si.trade_tick_size or si.point),
-            tick_value=float(si.trade_tick_value),
+            tick_size=tick_size,
+            tick_value=tick_value,
             contract_size=float(si.trade_contract_size),
             volume_min=float(si.volume_min),
             volume_max=float(si.volume_max),
@@ -194,6 +210,25 @@ class MT5Broker(Broker):
         if info.tick_value <= 0:
             raise BrokerError(f"{symbol}: tick value is 0 - open a chart for it in MT5 and retry")
         return info
+
+    def _value_per_price_unit(self, symbol: str, si) -> Optional[float]:
+        """Account-currency P/L of 1.0 lot for a 1.0 price move, from MT5's profit calculator. The
+        larger of the BUY and SELL loss is used, so position sizing errs on the safe side."""
+        calc = getattr(self.mt5, "order_calc_profit", None)
+        tick = self.mt5.symbol_info_tick(symbol)
+        if calc is None or tick is None or not getattr(tick, "ask", 0):
+            return None
+        step = max(float(si.trade_tick_size or si.point), float(si.point)) * 100
+        values = []
+        for order_type, open_px, close_px in ((self.c("ORDER_TYPE_BUY"), tick.ask, tick.ask - step),
+                                              (self.c("ORDER_TYPE_SELL"), tick.bid, tick.bid + step)):
+            try:
+                profit = calc(order_type, symbol, 1.0, float(open_px), float(close_px))
+            except Exception:  # pragma: no cover - older terminals
+                profit = None
+            if profit is not None and profit != 0:
+                values.append(abs(float(profit)) / step)
+        return max(values) if values else None
 
     def get_rates(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         rates = self.mt5.copy_rates_from_pos(symbol, self._timeframe(timeframe), 0, int(count) + 1)

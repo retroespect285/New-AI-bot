@@ -26,6 +26,7 @@ def test_setup_on_a_demo_account_with_defaults(tmp_path, monkeypatch, capsys):
     assert cfg.risk.risk_per_trade_pct == 0.5
     assert cfg.mt5.allow_live_account is False
     assert "Account fit" in out and "3-TEST-WITHOUT-TRADING.bat" in out
+    assert "per 1.00 move in price" in out
 
 
 def test_setup_on_a_small_real_cent_account(tmp_path, monkeypatch, capsys):
@@ -62,3 +63,11 @@ def test_order_rejection_is_explained(monkeypatch):
 
     res = b.open_position("XAUUSD", Side.BUY, 0.01, sl=1.0, tp=2.0, magic=1)
     assert not res.ok and "Algo Trading" in res.message
+
+
+def test_setup_on_a_too_small_account_says_so(tmp_path, monkeypatch, capsys):
+    fake_mt5.state.reset()
+    fake_mt5.state.equity = 2.0
+    assert _run(tmp_path, monkeypatch, ["", ""]) == 0
+    out = capsys.readouterr().out
+    assert "too small for the bot to open trades" in out and "4-START-TRADING.bat" not in out

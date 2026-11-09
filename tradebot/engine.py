@@ -153,6 +153,8 @@ class LiveEngine:
         tick = self.broker.get_tick(symbol)
         margin = self.broker.margin_required(symbol, Side.BUY, info.volume_min, tick.ask)
         report = fit_report(rows, acct.equity, acct.currency, cfg.risk.risk_per_trade_pct, margin, acct.margin_free)
+        report = (f"value: {info.volume_min:g} lot gains/loses {info.value_per_price_unit * info.volume_min:,.2f} "
+                  f"{acct.currency} per 1.00 move in price\n" + report)
         trouble = "WILL NOT" in report or "skipped" in report
         for line in report.splitlines():
             (log.warning if trouble else log.info)("%s %s", symbol, line)
