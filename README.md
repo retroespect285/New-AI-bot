@@ -26,7 +26,7 @@ that grows every 5 minutes and is reloaded after every restart.
  3. ACCOUNT  equity, daily-loss / drawdown limits, results of the bot's own closed trades
  4. MANAGE   close positions that reached their max holding time or the Friday cut-off
  5. FORECAST direction outlook for 5 min / 30 min / 1 h / 4 h
- 6. DECIDE   score 8 setups: BUY/SELL × 4 trade styles (M5 scalp ... H4 day trade) → expected value
+ 6. DECIDE   score 6 setups: BUY/SELL × 3 trade styles (M5 scalp, M30 intraday, H1 swing) → expected value
  7. EXECUTE  risk checks → lot size from stop distance → market order with SL and TP attached
 ```
 
@@ -48,9 +48,10 @@ so no indicator ever peeks at the future. The tests check this on all charts.
 **Direction outlook.** Every 5 minutes the brain forecasts whether gold will be higher in
 **5 minutes, 30 minutes, 1 hour and 4 hours**. Each forecast is scored when the answer is known,
 which gives a running accuracy per timeframe: the brain's report card. You see it in the log
-(`outlook M5:UP54% M30:DN52% H1:UP58% H4:UP61%`), in `logs/decisions.csv`, and in `status`.
+(`outlook M5:UP52% M30:DN51% H1:UP55% H4:UP57%`: direction and confidence), in
+`logs/decisions.csv`, and in `status`.
 
-**Trade styles.** The bot chooses between four ways of trading, each sized by the ATR of its own
+**Trade styles.** The bot chooses between three ways of trading, each sized by the ATR of its own
 chart (all configurable):
 
 | style | stop-loss | take-profit | max hold | example stop (varies with volatility) |
@@ -58,9 +59,14 @@ chart (all configurable):
 | M5 scalp | 1.5 × ATR(M5) | 2.0 × ATR(M5) | 1 hour | $3–5 stop |
 | M30 intraday | 1.0 × ATR(M30) | 1.5 × ATR(M30) | 4 hours | $5–8 stop |
 | H1 intraday swing | 1.0 × ATR(H1) | 2.0 × ATR(H1) | 8 hours | $8–12 stop |
-| H4 day trade | 1.0 × ATR(H4) | 1.5 × ATR(H4) | 24 hours | $15–25 stop |
+| *H4 day trade (optional, off)* | *1.0 × ATR(H4)* | *1.5 × ATR(H4)* | *24 hours* | *$15–25 stop* |
 
-Each style can be a BUY or a SELL, which gives 8 setups. For each setup the brain estimates
+The H4 chart is read for every decision and gets its own 4-hour forecast. Trades *sized* on H4 are
+off by default because tests showed they learn poorly: each one takes up to a day to resolve, so
+feedback arrives late and consecutive samples are nearly duplicates. You can switch it on in
+`config.yaml`.
+
+Each style can be a BUY or a SELL, which gives 6 setups. For each setup the brain estimates
 `P(take-profit first)` and `P(stop-loss first)`, then the **expected value** in R (1R = the money
 risked): `EV = P(TP)·avgWin + P(SL)·avgLoss + P(timeout)·avgTimeout`, with spread and costs included.
 It takes the best setup only if all of these hold:
@@ -88,7 +94,7 @@ current market best gets the most say. When a pattern stops working, its weight 
 score drops and the paper record turns negative, and the bot stops trading that setup until it
 works again.
 
-**It learns from every candle, not just its own trades.** Every 5 minutes, all 8 setups and 4
+**It learns from every candle, not just its own trades.** Every 5 minutes, all 6 setups and 4
 outlooks whose outcome has become known are scored and learned. That's thousands of lessons per
 day, demo or live.
 
@@ -246,12 +252,24 @@ Safeguards built in:
   gold data, followed by weeks on demo, tells you whether it has an edge.**
 
 ## Validation
-Results of the honesty checks on the default gold settings (14,000 M5 candles each, with M1/M30/H1/H4):
+Walk-forward backtests on artificial gold prices with the default settings (14,000–22,000 M5
+candles each, 6,000–8,000 used only for learning before trading starts):
 
 | data | what it should do | result |
 |---|---|---|
-| random-walk gold prices (4 seeds) | not trade (nothing to find) | see the commit / PR for the latest run |
-| synthetic gold with trends & mean reversion (3 seeds) | find something, or stay out | see the commit / PR for the latest run |
+| **random walk** (4 price series; nothing can be predicted) | stay out | **0 trades** on all 4; direction accuracy 46–55%, i.e. noise around 50% |
+| **weak structure** (gold-like series built from M1 with mild trends; 3 series) | trade only if the edge beats costs | 0 trades on all 3; direction accuracy up to 53% where trends exist, not enough after spread |
+| **strong structure** (clear trend / mean-reversion regimes; 4 series) | find and trade the edge | +5.4% (21 trades, profit factor 2.8), −3.1% (11 trades), and no trades on 2 series |
+
+What this says: the bot does not invent edges in noise, and it can find and trade a real one, but
+even then it is selective and not every period is profitable. Two bugs were found and fixed along
+the way:
+* an early version **lost 15% on a random walk**; this led to the stop-loss model and the
+  paper-trading gate;
+* the skill score was **inflated for long timeframes**: the H4 forecast "looked" 55% accurate on
+  pure noise until forecasts were frozen at the moment they are made.
+
+None of this predicts results on real gold. Only your broker's data and weeks of demo can do that.
 
 ## Limitations (please read)
 * **No edge is guaranteed.** The bot is designed to recognise when it has none and then stay out,

@@ -46,7 +46,9 @@ model:
     - {timeframe: M5,  sl_atr: 1.5, tp_atr: 2.0, max_hold_bars: 12}    # scalp, up to 1 hour
     - {timeframe: M30, sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 48}    # intraday, up to 4 hours
     - {timeframe: H1,  sl_atr: 1.0, tp_atr: 2.0, max_hold_bars: 96}    # intraday swing, up to 8 hours
-    - {timeframe: H4,  sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 288}   # 4-hour picture, up to 24 hours
+    # Optional: trades sized on the H4 chart, held up to 24 hours. Its results arrive a day late and
+    # overlap heavily, so it learns poorly (tested); H4 is read for every decision either way.
+    # - {timeframe: H4, sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 288}
   min_train_samples: 1500    # samples learned before a setup may trade
   min_eval_samples: 1000     # out-of-sample forecasts scored before the skill score is trusted
   min_skill: 0.005           # must beat the base rate by this much (log-loss skill score)
@@ -60,8 +62,8 @@ model:
   min_paper_tstat: 1.5
   loss_decay: 0.995          # memory of the model weights (~200 samples)
   skill_decay: 0.999         # memory of the skill score (~1000 samples)
-  hedge_eta: 1.0
-  logit_lr: 0.01
+  hedge_eta: 0.3            # how sharply the experts' weights follow recent accuracy
+  logit_lr: 0.002
   logit_l2: 0.0001
   scaler_span: 3000
   gbm_enabled: true

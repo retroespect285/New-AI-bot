@@ -80,11 +80,13 @@ class TradeStyle:
 
 
 def _gold_styles() -> List[TradeStyle]:
+    # An H4-sized style (e.g. TradeStyle("H4", 1.0, 1.5, 288): up to 24 hours) can be added in the
+    # config, but its outcomes arrive a day late and overlap heavily, so it learns poorly; the H4
+    # chart is still read for every decision and forecast every 5 minutes.
     return [
         TradeStyle("M5", 1.5, 2.0, 12),    # scalp: up to 1 hour
         TradeStyle("M30", 1.0, 1.5, 48),   # intraday: up to 4 hours
         TradeStyle("H1", 1.0, 2.0, 96),    # intraday swing: up to 8 hours
-        TradeStyle("H4", 1.0, 1.5, 288),   # day trade on the 4-hour picture: up to 24 hours
     ]
 
 
@@ -113,8 +115,8 @@ class ModelConfig:
     min_paper_tstat: float = 1.5
     loss_decay: float = 0.995  # memory of the expert weights (~200 samples: adapts quickly)
     skill_decay: float = 0.999  # memory of the skill score that gates trading (~1000 samples)
-    hedge_eta: float = 1.0
-    logit_lr: float = 0.01
+    hedge_eta: float = 0.3  # how sharply the experts' weights follow recent accuracy
+    logit_lr: float = 0.002
     logit_l2: float = 1e-4
     scaler_span: int = 3000
     gbm_enabled: bool = True
