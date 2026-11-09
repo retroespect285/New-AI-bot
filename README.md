@@ -341,6 +341,24 @@ manage risk normally. Then:
 
 If a trade is skipped for size or margin, `logs/decisions.csv` says so with the numbers.
 
+**No cent account? Small-account mode (your choice, high risk).** If you want to trade a small
+standard account anyway, run `1-INSTALL-AND-SETUP.bat` again. When it sees the account is too small,
+it shows what one minimum-size losing trade would cost and offers small-account mode:
+
+* the bot may trade the **minimum lot (0.01)** as long as one losing trade costs at most the share
+  of the account **you** choose (`risk.min_lot_max_risk_pct`, for example 15%);
+* a **micro style** is added: stop 1 ATR of the **1-minute** chart, target 1.5 ATR, held up to 30
+  minutes. Its stop is about a third of the M5 scalp's, so each trade risks less. The brain learns
+  whether it makes money after the spread and only trades it if it does;
+* limits that fit a tiny account: **stop for the day after one losing trade** (`max_daily_loss_pct`
+  = half the cap), **stop completely** after losing half the account from its peak
+  (`max_drawdown_pct` = 50%), one trade at a time;
+* as soon as the account is big enough, normal percentage sizing takes over automatically.
+
+Be clear about what this means: with $20, one losing trade can cost 10–30% of the account, and a few
+losses in a row can wipe out most of it. The bot still only trades when its forecasts show an edge,
+so it may also simply not trade for a long time.
+
 ## Running it 24/5
 * Run it on a **Windows VPS** close to your broker's server, so it doesn't depend on your home PC.
 * Use `4-START-TRADING.bat` with Windows Task Scheduler ("At log on") to restart after reboots. It

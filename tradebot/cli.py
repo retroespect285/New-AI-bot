@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -94,7 +95,7 @@ def _symbol_report(cfg: BotConfig, broker, symbol: str, acct) -> str:
         print(f"  {tf:>4}: {len(bars):6d} of {want} wanted closed bars "
               f"({bars['time'].iat[0]} -> {bars['time'].iat[-1]})")
     rows = assess_fit(info, cfg.model.styles, latest_atr(by_tf, cfg.model.atr_period), acct.equity,
-                      cfg.risk.risk_per_trade_pct)
+                      cfg.risk.risk_per_trade_pct, cfg.risk.min_lot_max_risk_pct)
     margin = broker.margin_required(symbol, Side.BUY, info.volume_min, tick.ask)
     report = fit_report(rows, acct.equity, acct.currency, cfg.risk.risk_per_trade_pct, margin, acct.margin_free)
     print(report)
@@ -127,6 +128,85 @@ def _ask(question: str, default: str = "") -> str:
     except EOFError:
         answer = ""
     return answer or default
+
+
+MICRO_STYLE = {"timeframe": "M1", "sl_atr": 1.0, "tp_atr": 1.5, "max_hold_bars": 6}
+
+
+def _style_dict(s) -> dict:
+    d = {"timeframe": s.timeframe, "sl_atr": s.sl_atr, "tp_atr": s.tp_atr, "max_hold_bars": s.max_hold_bars}
+    if s.trail_atr:
+        d.update(trail_atr=s.trail_atr, trail_start_r=s.trail_start_r)
+    return d
+
+
+def _small_account_step(cfg: BotConfig, broker, symbol: str, acct, risk: float):
+    """If even the minimum lot is too big for the account, explain the numbers and offer
+    small-account mode. Returns the settings to write, or None."""
+    from .config import TradeStyle
+    from .fit import assess_fit, latest_atr
+    from .types import Side
+
+    info = broker.symbol_info(symbol)
+    styles = list(cfg.model.styles)
+    can_micro = "M1" in cfg.model.context_timeframes or cfg.trading.timeframe == "M1"
+    if can_micro and not any(s.timeframe == "M1" for s in styles):
+        styles.append(TradeStyle(**MICRO_STYLE))
+    tfs = sorted({s.timeframe for s in styles})
+    atr_now = latest_atr({tf: broker.get_rates(symbol, tf, 300) for tf in tfs}, cfg.model.atr_period)
+    if any(r.fits for r in assess_fit(info, cfg.model.styles, atr_now, acct.equity, risk)):
+        return None  # the normal styles already fit
+    rows = assess_fit(info, styles, atr_now, acct.equity, risk)
+    if not rows:
+        return None
+    tick = broker.get_tick(symbol)
+    margin = broker.margin_required(symbol, Side.BUY, info.volume_min, tick.ask)
+    print(f"\n  Your account is small for {symbol}. The smallest trade the broker allows is "
+          f"{info.volume_min:g} lot, and right now one losing trade of that size would cost:")
+    for r in rows:
+        micro = "   <- micro style: trades the 1-minute moves" if r.style.startswith("M1:") else ""
+        print(f"    {r.style:<20} stop ~{r.stop:,.{info.digits}f} -> {r.min_risk:,.2f} {acct.currency} = "
+              f"{r.min_risk_pct:.0f}% of the account{micro}")
+    if margin is not None and margin > acct.margin_free * 0.9:
+        print(f"  The broker also needs {margin:,.2f} {acct.currency} of margin for that trade, more than you have free. "
+              "Small-account mode cannot help: use a cent account or add funds.")
+        return None
+    cheapest = min(rows, key=lambda r: r.min_risk_pct)
+    suggest = min(50, max(5, 5 * math.ceil(cheapest.min_risk_pct * 1.5 / 5)))
+    print("\n  SMALL-ACCOUNT MODE lets the bot trade the minimum lot anyway. It is your choice, but be clear:")
+    print(f"   - one losing trade can cost {cheapest.min_risk_pct:.0f}% of the account or more, and a few losses "
+          "in a row can wipe most of it out;")
+    print("   - the bot still only trades when its forecasts have an edge, and stops for the day after a loss;")
+    print("   - a cent account avoids all this (same $20 shown as 2,000 cents, trades 100x smaller).")
+    if _ask("  Turn on small-account mode? Type yes or no", "no").lower() not in ("y", "yes"):
+        print("  Small-account mode stays off.")
+        return None
+    cap = None
+    while cap is None:
+        text = _ask("  Largest share of the account ONE trade may risk, in %", str(suggest)).replace(",", ".").rstrip("%")
+        try:
+            value = float(text)
+        except ValueError:
+            value = -1
+        if 0 < value <= 100:
+            cap = value
+        else:
+            print("  Please type a number between 1 and 100.")
+    allowed = [r for r in rows if r.min_risk_pct <= cap]
+    print(f"  With {cap:g}% the bot may use: {', '.join(r.style for r in allowed) or 'none right now'}"
+          " (this changes as gold gets calmer or wilder).")
+    out = {"risk": {
+        "min_lot_max_risk_pct": cap,
+        "max_daily_loss_pct": round(max(3.0, cap / 2), 1),  # one full loss ends the day
+        "max_drawdown_pct": round(min(90.0, max(50.0, cap * 1.5)), 1),  # kill switch
+        "max_total_positions": 1,
+    }}
+    if len(styles) > len(cfg.model.styles):
+        out["styles"] = [_style_dict(s) for s in styles]
+        print("  Added the micro style. The brain will study history once more at the next start (about 10 minutes).")
+    print(f"  Limits: stop for the day after losing {out['risk']['max_daily_loss_pct']}%; stop completely after losing "
+          f"{out['risk']['max_drawdown_pct']}% from the peak.")
+    return out
 
 
 def cmd_setup(cfg: BotConfig, args) -> int:
@@ -210,6 +290,8 @@ def cmd_setup(cfg: BotConfig, args) -> int:
             else:
                 print("  Please type a number between 0.1 and 5.")
 
+        small = _small_account_step(cfg, broker, symbol, acct, risk)
+
         allow_live = cfg.mt5.allow_live_account
         print("\nStep 4 of 4: real money")
         if acct.is_demo:
@@ -232,6 +314,12 @@ def cmd_setup(cfg: BotConfig, args) -> int:
         data.setdefault("risk", {})["risk_per_trade_pct"] = risk
         if cent or acct.equity < 500:
             data["risk"].setdefault("max_total_positions", 1)
+        if small is not None:
+            data["risk"].update(small["risk"])
+            if small.get("styles"):
+                data.setdefault("model", {})["styles"] = small["styles"]
+        elif data.get("risk", {}).get("min_lot_max_risk_pct") is not None:
+            data["risk"]["min_lot_max_risk_pct"] = None  # small-account mode switched off
         path.write_text("# Written by `python -m tradebot setup`. See config.example.yaml for every option.\n"
                         + yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
         new_cfg = load_config(str(path))

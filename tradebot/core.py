@@ -349,9 +349,10 @@ class BotCore:
             lots, risk_money = self.risk.position_size(equity, info, sl_dist)
             if lots <= 0:
                 min_risk = sl_dist * info.value_per_price_unit * info.volume_min
+                limit = cfg.risk.min_lot_max_risk_pct or cfg.risk.risk_per_trade_pct
                 ok, why = False, (f"minimum lot size would exceed the risk budget: {info.volume_min:g} lot "
                                   f"risks {min_risk:.2f} = {100 * min_risk / max(equity, 1e-9):.1f}% of equity "
-                                  f"(limit {cfg.risk.risk_per_trade_pct:g}%)")
+                                  f"(limit {limit:g}%)")
         if ok:
             margin = self.broker.margin_required(symbol, arm.side, lots, price)
             if margin is not None and margin > acct.margin_free * 0.9:

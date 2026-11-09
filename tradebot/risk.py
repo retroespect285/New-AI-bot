@@ -148,5 +148,10 @@ class RiskManager:
         lots = min(lots, info.volume_max, self.cfg.max_lots)
         lots = floor_to_step(lots, info.volume_step)
         if lots < info.volume_min - 1e-12:
+            # Small-account mode: the minimum lot is allowed up to the user's own cap.
+            cap = self.cfg.min_lot_max_risk_pct
+            min_risk = info.volume_min * loss_per_lot
+            if cap is not None and min_risk <= equity * cap / 100.0 + 1e-9:
+                return info.volume_min, min_risk
             return 0.0, 0.0
         return lots, lots * loss_per_lot

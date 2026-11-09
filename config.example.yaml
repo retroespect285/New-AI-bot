@@ -102,6 +102,9 @@ risk:
   max_lots: 5.0
   breakeven_at_r: null       # e.g. 1.0 = move the stop to entry once the trade is +1R
   exit_on_reversal: true     # close a trade when the brain becomes confident the market turned
+  # SMALL-ACCOUNT MODE (null = off): allow the minimum lot even when it risks more than
+  # risk_per_trade_pct, up to this % of equity per trade. High risk - see README "Small accounts".
+  min_lot_max_risk_pct: null
 
 readiness:                   # what `python -m tradebot readiness` requires before saying "go live"
   min_days: 14

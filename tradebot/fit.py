@@ -27,6 +27,7 @@ class StyleFit:
     min_risk_pct: float  # ... as % of equity
     fits: bool
     digits: int = 2
+    small_mode: bool = False  # fits only thanks to small-account mode
 
 
 def latest_atr(bars_by_tf: Mapping[str, pd.DataFrame], period: int = 14) -> Dict[str, float]:
@@ -42,8 +43,9 @@ def latest_atr(bars_by_tf: Mapping[str, pd.DataFrame], period: int = 14) -> Dict
 
 
 def assess_fit(info: SymbolInfo, styles: List[TradeStyle], atr_by_tf: Mapping[str, float],
-               equity: float, risk_pct: float) -> List[StyleFit]:
+               equity: float, risk_pct: float, min_lot_cap_pct: Optional[float] = None) -> List[StyleFit]:
     budget = equity * risk_pct / 100.0
+    cap = equity * min_lot_cap_pct / 100.0 if min_lot_cap_pct else 0.0
     rows = []
     for s in styles:
         a = atr_by_tf.get(s.timeframe)
@@ -52,7 +54,9 @@ def assess_fit(info: SymbolInfo, styles: List[TradeStyle], atr_by_tf: Mapping[st
         stop = s.sl_atr * a
         min_risk = stop * info.value_per_price_unit * info.volume_min
         pct = 100.0 * min_risk / equity if equity > 0 else float("inf")
-        rows.append(StyleFit(s.name, stop, info.volume_min, min_risk, pct, min_risk <= budget + 1e-9, info.digits))
+        normal = min_risk <= budget + 1e-9
+        small = not normal and min_risk <= cap + 1e-9
+        rows.append(StyleFit(s.name, stop, info.volume_min, min_risk, pct, normal or small, info.digits, small))
     return rows
 
 
@@ -64,12 +68,16 @@ def fit_report(rows: List[StyleFit], equity: float, currency: str, risk_pct: flo
     for r in rows:
         lines.append(f"  {r.style:<24} stop now ~{r.stop:,.{r.digits}f} -> smallest trade ({r.min_lot:g} lot) risks "
                      f"{r.min_risk:,.2f} {currency} = {r.min_risk_pct:.1f}% of equity  "
-                     f"[{'OK' if r.fits else 'TOO BIG - will be skipped'}]")
+                     f"[{'OK (small-account mode)' if r.small_mode else 'OK' if r.fits else 'TOO BIG - will be skipped'}]")
     margin_ok = True
     if min_lot_margin is not None and free_margin is not None:
         margin_ok = min_lot_margin <= free_margin * 0.9
         lines.append(f"  margin for the smallest trade: {min_lot_margin:,.2f} {currency} "
                      f"(free margin {free_margin:,.2f})" + ("" if margin_ok else "  [NOT ENOUGH]"))
+    if any(r.small_mode for r in rows) and margin_ok:
+        worst = max(r.min_risk_pct for r in rows if r.fits)
+        lines.append(f"  -> SMALL-ACCOUNT MODE: the bot trades the minimum lot. One losing trade can cost up to "
+                     f"{worst:.0f}% of the account.")
     if rows and all(r.fits for r in rows) and margin_ok:
         lines.append("  -> every trade style fits this account.")
         return "\n".join(lines)
@@ -86,7 +94,9 @@ def fit_report(rows: List[StyleFit], equity: float, currency: str, risk_pct: flo
                      "($20 = 2,000 USC), which usually fits;")
         lines.append(f"       (2) have about {need:,.0f} {currency} of equity at your {risk_pct:g}% risk;")
         lines.append(f"       (3) raise risk.risk_per_trade_pct (5% max): needs about {need5:,.0f} {currency}, "
-                     "but then each losing trade costs 5% of the account.")
+                     "but then each losing trade costs 5% of the account;")
+        lines.append(f"       (4) small-account mode: allow the minimum lot even though one losing trade costs about "
+                     f"{cheapest.min_risk_pct:.0f}% or more of the account (run 1-INSTALL-AND-SETUP.bat again).")
     if not margin_ok:
         lines.append("     The broker would also reject the order for lack of margin.")
     return "\n".join(lines)

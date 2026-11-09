@@ -86,3 +86,48 @@ def test_check_command_reports_account_fit(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Account fit: equity 20.00 USD" in out
     assert "WILL NOT OPEN TRADES" in out
+
+
+# ---------------------------------------------------------------- small-account mode
+from tradebot.config import RiskConfig  # noqa: E402
+from tradebot.risk import RiskManager  # noqa: E402
+
+
+def test_small_account_mode_allows_the_minimum_lot_up_to_the_cap():
+    gold_1usd = GOLD  # 0.01 lot = 1 oz: $1 per $1 move
+    assert RiskManager(RiskConfig(risk_per_trade_pct=1.0)).position_size(20.0, gold_1usd, 2.0) == (0.0, 0.0)
+    lots, risk = RiskManager(RiskConfig(risk_per_trade_pct=1.0, min_lot_max_risk_pct=15)).position_size(
+        20.0, gold_1usd, 2.0)
+    assert lots == 0.01 and risk == 2.0  # 10% of $20, under the 15% cap
+    assert RiskManager(RiskConfig(min_lot_max_risk_pct=5)).position_size(20.0, gold_1usd, 2.0) == (0.0, 0.0)
+    # a bigger account goes back to normal % sizing automatically
+    lots, risk = RiskManager(RiskConfig(risk_per_trade_pct=1.0, min_lot_max_risk_pct=15)).position_size(
+        1000.0, gold_1usd, 2.0)
+    assert lots == 0.05 and risk == 10.0
+
+
+def test_fit_report_in_small_account_mode():
+    styles = STYLES + [TradeStyle("M1", 1.0, 1.5, 6)]
+    rows = assess_fit(GOLD, styles, {**ATR, "M1": 2.0}, equity=20.0, risk_pct=1.0, min_lot_cap_pct=15)
+    assert [r.fits for r in rows] == [False, False, False, True] and rows[3].small_mode
+    report = fit_report(rows, 20.0, "USD", 1.0, 8.25, 20.0)
+    assert "OK (small-account mode)" in report and "SMALL-ACCOUNT MODE" in report and "WILL NOT" not in report
+
+
+def test_twenty_dollars_trades_the_minimum_lot_in_small_account_mode(monkeypatch):
+    cfg = small_config()
+    cfg.risk.max_spread_sl_fraction = 1.0
+    cfg.risk.min_lot_max_risk_pct = 50.0
+    bars = synthetic_bars(900, seed=11)
+    sim = SimBroker({"EURUSD": bars}, {"EURUSD": EURUSD}, initial_balance=20.0)
+    core = BotCore(cfg, sim)
+    core.add_symbol("EURUSD")
+    prep = core.prepare("EURUSD", bars)
+    brain = core.brain("EURUSD", prep.features.names)
+    monkeypatch.setattr(brain, "decide", lambda *a, **k: Decision(make_arms(cfg.model.styles)[0], prob=0.6,
+                                                                  ev_r=0.3, reason="signal"))
+    sim.set_index("EURUSD", 700)
+    core.on_bar("EURUSD", prep, 700)
+    (pos,) = sim.positions()
+    assert pos.volume == 0.01
+    assert core.open_risk[pos.ticket]["risk_money"] <= 20.0 * 0.5

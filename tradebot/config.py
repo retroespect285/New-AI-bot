@@ -167,6 +167,12 @@ class RiskConfig:
     # Close an open trade when the brain becomes confident the market will go the other way
     # (an opposite setup passes every gate). The opposite trade may then be opened.
     exit_on_reversal: bool = True
+    # SMALL-ACCOUNT MODE (off when null). On a small account even the minimum lot (0.01) can risk
+    # far more than risk_per_trade_pct. With this set, the bot may still trade the minimum lot
+    # as long as its loss at the stop is at most this % of equity. You accept that one losing
+    # trade costs up to this much of the account. Normal % sizing resumes once the account is
+    # big enough.
+    min_lot_max_risk_pct: Optional[float] = None
 
 
 @dataclass
@@ -249,6 +255,8 @@ class BotConfig:
             raise ConfigError(f"trading.lookback_bars must be >= 300 + the longest max_hold_bars ({300 + m.max_hold})")
         if not 0 < r.risk_per_trade_pct <= 5:
             raise ConfigError("risk.risk_per_trade_pct must be in (0, 5]")
+        if r.min_lot_max_risk_pct is not None and not 0 < r.min_lot_max_risk_pct <= 100:
+            raise ConfigError("risk.min_lot_max_risk_pct must be in (0, 100] or null")
         if not 0 < m.loss_decay < 1 or not 0 < m.skill_decay < 1:
             raise ConfigError("model.loss_decay and model.skill_decay must be in (0, 1)")
         if not 0 <= t.session.start_hour <= 24 or not 0 <= t.session.end_hour <= 24:

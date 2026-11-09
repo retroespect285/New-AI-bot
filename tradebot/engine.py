@@ -149,13 +149,13 @@ class LiveEngine:
         """Warn loudly if the account is too small for even the smallest trade."""
         cfg = self.cfg
         rows = assess_fit(info, cfg.model.styles, latest_atr(bars_by_tf, cfg.model.atr_period),
-                          acct.equity, cfg.risk.risk_per_trade_pct)
+                          acct.equity, cfg.risk.risk_per_trade_pct, cfg.risk.min_lot_max_risk_pct)
         tick = self.broker.get_tick(symbol)
         margin = self.broker.margin_required(symbol, Side.BUY, info.volume_min, tick.ask)
         report = fit_report(rows, acct.equity, acct.currency, cfg.risk.risk_per_trade_pct, margin, acct.margin_free)
         report = (f"value: {info.volume_min:g} lot gains/loses {info.value_per_price_unit * info.volume_min:,.2f} "
                   f"{acct.currency} per 1.00 move in price\n" + report)
-        trouble = "WILL NOT" in report or "skipped" in report
+        trouble = "WILL NOT" in report or "skipped" in report or "SMALL-ACCOUNT" in report
         for line in report.splitlines():
             (log.warning if trouble else log.info)("%s %s", symbol, line)
 

@@ -34,7 +34,8 @@ def test_setup_on_a_small_real_cent_account(tmp_path, monkeypatch, capsys):
     fake_mt5.state.trade_mode = fake_mt5.ACCOUNT_TRADE_MODE_REAL
     fake_mt5.state.equity = 20.0
     (tmp_path / "config.yaml").write_text("risk:\n  max_daily_loss_pct: 2.0\n")
-    assert _run(tmp_path, monkeypatch, ["2", "", "yes"]) == 0
+    # symbol 2, default risk, small-account mode: no (the fake symbol isn't really a cent symbol), real money: yes
+    assert _run(tmp_path, monkeypatch, ["2", "", "no", "yes"]) == 0
     data = yaml.safe_load((tmp_path / "config.yaml").read_text())
     assert data["trading"]["symbols"] == ["XAUUSDc"]
     assert data["risk"]["risk_per_trade_pct"] == 1.0  # suggested for a small account
@@ -71,3 +72,27 @@ def test_setup_on_a_too_small_account_says_so(tmp_path, monkeypatch, capsys):
     assert _run(tmp_path, monkeypatch, ["", ""]) == 0
     out = capsys.readouterr().out
     assert "too small for the bot to open trades" in out and "4-START-TRADING.bat" not in out
+
+
+def test_setup_offers_small_account_mode_and_writes_it(tmp_path, monkeypatch, capsys):
+    fake_mt5.state.reset()
+    fake_mt5.state.equity = 20.0
+    # symbol: default, risk: default (1%), small-account mode: yes, cap: suggested
+    assert _run(tmp_path, monkeypatch, ["", "", "yes", ""]) == 0
+    out = capsys.readouterr().out
+    assert "SMALL-ACCOUNT MODE lets the bot trade the minimum lot" in out and "micro style" in out
+    cfg = load_config(str(tmp_path / "config.yaml"))
+    assert cfg.risk.min_lot_max_risk_pct == 10.0
+    assert cfg.risk.max_total_positions == 1 and cfg.risk.max_daily_loss_pct == 5.0
+    assert cfg.risk.max_drawdown_pct == 50.0
+    assert any(s.timeframe == "M1" for s in cfg.model.styles) and len(cfg.model.styles) == 4
+    assert "OK (small-account mode)" in out
+
+
+def test_setup_small_account_mode_declined(tmp_path, monkeypatch, capsys):
+    fake_mt5.state.reset()
+    fake_mt5.state.equity = 20.0
+    assert _run(tmp_path, monkeypatch, ["", "", "no"]) == 0
+    cfg = load_config(str(tmp_path / "config.yaml"))
+    assert cfg.risk.min_lot_max_risk_pct is None and len(cfg.model.styles) == 3
+    assert "too small for the bot to open trades" in capsys.readouterr().out
