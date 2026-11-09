@@ -95,9 +95,9 @@ def _gold_styles() -> List[TradeStyle]:
         TradeStyle("M5", 1.5, 2.0, 12),    # scalp: up to 1 hour
         TradeStyle("M30", 1.0, 1.5, 48),   # intraday: up to 4 hours
         TradeStyle("H1", 1.0, 2.0, 96),    # intraday swing: up to 8 hours
-        # trailing variants: the stop follows the price once the trade is +1R, target further away
-        TradeStyle("M30", 1.0, 3.0, 48, trail_atr=1.0, trail_start_r=1.0),
-        TradeStyle("H1", 1.0, 3.0, 96, trail_atr=1.0, trail_start_r=1.0),
+        # Trailing variants (stop follows the price once +1R) are supported, e.g.
+        # TradeStyle("M30", 1.0, 3.0, 48, trail_atr=1.0, trail_start_r=1.0); they are not on by
+        # default because they did not improve the validation backtests (see README).
     ]
 
 

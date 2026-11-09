@@ -49,8 +49,10 @@ model:
     - {timeframe: M5,  sl_atr: 1.5, tp_atr: 2.0, max_hold_bars: 12}    # scalp, up to 1 hour
     - {timeframe: M30, sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 48}    # intraday, up to 4 hours
     - {timeframe: H1,  sl_atr: 1.0, tp_atr: 2.0, max_hold_bars: 96}    # intraday swing, up to 8 hours
-    - {timeframe: M30, sl_atr: 1.0, tp_atr: 3.0, max_hold_bars: 48, trail_atr: 1.0, trail_start_r: 1.0}
-    - {timeframe: H1,  sl_atr: 1.0, tp_atr: 3.0, max_hold_bars: 96, trail_atr: 1.0, trail_start_r: 1.0}
+    # Trailing-stop styles: remove the "#" to let the brain choose them too. They did not improve the
+    # validation backtests, so compare a backtest on your gold data with and without them first.
+    # - {timeframe: M30, sl_atr: 1.0, tp_atr: 3.0, max_hold_bars: 48, trail_atr: 1.0, trail_start_r: 1.0}
+    # - {timeframe: H1,  sl_atr: 1.0, tp_atr: 3.0, max_hold_bars: 96, trail_atr: 1.0, trail_start_r: 1.0}
     # Optional: trades sized on the H4 chart, held up to 24 hours. Its results arrive a day late and
     # overlap heavily, so it learns poorly (tested); H4 is read for every decision either way.
     # - {timeframe: H4, sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 288}
