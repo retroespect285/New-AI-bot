@@ -1,6 +1,5 @@
 @echo off
-REM Usage: scripts\backtest.bat data\EURUSD_M5.csv
+REM Usage: scripts\backtest.bat data\XAUUSD_M5.csv   (run "python -m tradebot export" first)
 cd /d "%~dp0\.."
-call .venv\Scripts\activate.bat
-if "%~1"=="" (python -m tradebot backtest) else (python -m tradebot backtest --csv %1)
+if "%~1"=="" (".venv\Scripts\python.exe" -m tradebot backtest) else (".venv\Scripts\python.exe" -m tradebot backtest --csv %1)
 pause

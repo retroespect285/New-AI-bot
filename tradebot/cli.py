@@ -1,6 +1,7 @@
 """Command line: ``python -m tradebot <command>``.
 
 Commands
+  setup      guided set-up: connects to MT5, finds gold, asks two questions, writes config.yaml
   check      connect to MT5 and print account + symbol details (no trading)
   live       run the bot on MT5 (use a DEMO account first; --dry-run sends no orders)
   backtest   walk-forward backtest on exported CSVs (all timeframes) or synthetic data
@@ -73,35 +74,175 @@ def _mt5_broker(cfg: BotConfig):
     return MT5Broker(cfg.mt5)
 
 
-def cmd_check(cfg: BotConfig, args) -> int:
+def _symbol_report(cfg: BotConfig, broker, symbol: str, acct) -> str:
+    """Price, history available on every chart, and whether this account can afford the trades."""
     from .fit import assess_fit, fit_report, latest_atr
     from .types import Side
 
+    info = broker.symbol_info(symbol)
+    tick = broker.get_tick(symbol)
+    print(f"{symbol}: bid {tick.bid} ask {tick.ask} spread {tick.spread / info.point:.0f} points | "
+          f"spec {info.to_dict()}")
+    by_tf = {}
+    for tf in [cfg.trading.timeframe] + cfg.model.context_timeframes:
+        want = (cfg.trading.warmup_bars if tf == cfg.trading.timeframe
+                else cfg.context_fetch_bars(tf, cfg.trading.warmup_bars))
+        bars = broker.get_rates(symbol, tf, want)
+        by_tf[tf] = bars
+        print(f"  {tf:>4}: {len(bars):6d} of {want} wanted closed bars "
+              f"({bars['time'].iat[0]} -> {bars['time'].iat[-1]})")
+    rows = assess_fit(info, cfg.model.styles, latest_atr(by_tf, cfg.model.atr_period), acct.equity,
+                      cfg.risk.risk_per_trade_pct)
+    margin = broker.margin_required(symbol, Side.BUY, info.volume_min, tick.ask)
+    report = fit_report(rows, acct.equity, acct.currency, cfg.risk.risk_per_trade_pct, margin, acct.margin_free)
+    print(report)
+    return report
+
+
+def cmd_check(cfg: BotConfig, args) -> int:
     broker = _mt5_broker(cfg)
     broker.connect()
     try:
         acct = broker.account()
-        print(f"Account {acct.login}: balance {acct.balance:.2f} {acct.currency}, equity {acct.equity:.2f}, "
-              f"{'DEMO' if acct.is_demo else 'REAL MONEY'}, trading allowed: {acct.trade_allowed}")
+        print(f"Connected to MetaTrader 5. Account {acct.login}: balance {acct.balance:.2f} {acct.currency}, "
+              f"equity {acct.equity:.2f}, {'DEMO' if acct.is_demo else 'REAL MONEY'}")
+        if not acct.is_demo and not cfg.mt5.allow_live_account:
+            print("  Note: this is a real-money account and mt5.allow_live_account is false - the bot will "
+                  "refuse to trade it (run setup again to change that).")
         for symbol in cfg.trading.symbols:
-            info = broker.symbol_info(symbol)
-            tick = broker.get_tick(symbol)
-            print(f"{symbol}: bid {tick.bid} ask {tick.ask} spread {tick.spread / info.point:.0f} points | "
-                  f"spec {info.to_dict()}")
-            by_tf = {}
-            for tf in [cfg.trading.timeframe] + cfg.model.context_timeframes:
-                want = (cfg.trading.warmup_bars if tf == cfg.trading.timeframe
-                        else cfg.context_fetch_bars(tf, cfg.trading.warmup_bars))
-                bars = broker.get_rates(symbol, tf, want)
-                by_tf[tf] = bars
-                print(f"  {tf:>4}: {len(bars):6d} of {want} wanted closed bars "
-                      f"({bars['time'].iat[0]} -> {bars['time'].iat[-1]})")
-            rows = assess_fit(info, cfg.model.styles, latest_atr(by_tf, cfg.model.atr_period), acct.equity,
-                              cfg.risk.risk_per_trade_pct)
-            margin = broker.margin_required(symbol, Side.BUY, info.volume_min, tick.ask)
-            print(fit_report(rows, acct.equity, acct.currency, cfg.risk.risk_per_trade_pct, margin, acct.margin_free))
+            _symbol_report(cfg, broker, symbol, acct)
         positions = broker.positions(magic=cfg.trading.magic)
         print(f"Open positions of this bot (magic {cfg.trading.magic}): {len(positions)}")
+    finally:
+        broker.shutdown()
+    return 0
+
+
+def _ask(question: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{question}{suffix}: ").strip()
+    except EOFError:
+        answer = ""
+    return answer or default
+
+
+def cmd_setup(cfg: BotConfig, args) -> int:
+    """Guided set-up for people who don't want to edit files."""
+    import shutil
+
+    import yaml
+
+    from .brokers.base import BrokerError
+
+    path = Path(args.config)
+    print("\n=== New-AI-bot set-up ===")
+    print("Step 1 of 4: connecting to MetaTrader 5 on this computer ...")
+    broker = _mt5_broker(cfg)
+    try:
+        broker.connect()
+    except BrokerError as exc:
+        print(f"\n{exc}\n")
+        if "package is not installed" in str(exc):
+            return 1
+        answer = _ask("If MT5 is open and logged in but installed in an unusual folder, paste the full path of "
+                      "terminal64.exe here (or just press Enter to stop)")
+        if not answer:
+            print("\nOpen MetaTrader 5, log in, then run set-up again.")
+            return 1
+        cfg.mt5.path = answer.strip().strip('"')
+        broker = _mt5_broker(cfg)
+        try:
+            broker.connect()
+        except BrokerError as exc2:
+            print(f"\nStill no connection: {exc2}")
+            return 1
+    try:
+        acct = broker.account()
+        kind = "DEMO" if acct.is_demo else "REAL MONEY"
+        print(f"  Connected: account {acct.login}, balance {acct.balance:,.2f} {acct.currency} ({kind})")
+        cent = acct.currency.upper() in ("USC", "EUC", "GBC") or "cent" in acct.currency.lower()
+
+        print("\nStep 2 of 4: which gold symbol should the bot trade?")
+        symbols = broker.find_symbols(["XAU", "GOLD"])
+        symbol = None
+        if symbols:
+            for k, (name, desc) in enumerate(symbols, 1):
+                print(f"  {k}) {name:<14} {desc}")
+            default = 1
+            if cent:  # prefer a cent-looking symbol on a cent account
+                for k, (name, _) in enumerate(symbols, 1):
+                    if name.lower().endswith("c"):
+                        default = k
+                        break
+            while symbol is None:
+                choice = _ask("Type the number of the symbol", str(default))
+                if choice.isdigit() and 1 <= int(choice) <= len(symbols):
+                    symbol = symbols[int(choice) - 1][0]
+                elif any(choice == n for n, _ in symbols):
+                    symbol = choice
+                else:
+                    print("  Please type one of the numbers above.")
+        else:
+            print("  No gold symbol found. In MT5: View > Market Watch, right-click > Symbols, search 'XAU' or "
+                  "'GOLD', select it and click Show Symbol.")
+            symbol = _ask("Or type the exact symbol name here")
+            if not symbol:
+                return 1
+        broker.symbol_info(symbol)  # makes sure MT5 shows it in Market Watch
+        print(f"  Using {symbol}")
+
+        print("\nStep 3 of 4: how much of the account may one losing trade cost?")
+        default_risk = "1.0" if cent or acct.equity < 500 else "0.5"
+        print(f"  (in percent; {default_risk} is suggested{' for a cent / small account' if default_risk == '1.0' else ''}"
+              f"; the maximum allowed is 5)")
+        risk = None
+        while risk is None:
+            text = _ask("Risk per trade in %", default_risk).replace(",", ".").rstrip("%")
+            try:
+                value = float(text)
+            except ValueError:
+                value = -1
+            if 0 < value <= 5:
+                risk = value
+            else:
+                print("  Please type a number between 0.1 and 5.")
+
+        allow_live = cfg.mt5.allow_live_account
+        print("\nStep 4 of 4: real money")
+        if acct.is_demo:
+            print("  This is a demo account - nothing to confirm.")
+        else:
+            print("  This is a REAL-MONEY account. The bot can lose money; only continue if you accept that.")
+            answer = _ask("Allow the bot to trade this real account? Type yes or no", "no").lower()
+            allow_live = answer in ("y", "yes")
+            print("  Allowed." if allow_live else "  Not allowed - the bot will only watch (dry run) on this account.")
+
+        data = {}
+        if path.exists():
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+        data.setdefault("mt5", {})
+        data["mt5"]["allow_live_account"] = bool(allow_live)
+        if cfg.mt5.path:
+            data["mt5"]["path"] = cfg.mt5.path
+        data.setdefault("trading", {})["symbols"] = [symbol]
+        data.setdefault("risk", {})["risk_per_trade_pct"] = risk
+        if cent or acct.equity < 500:
+            data["risk"].setdefault("max_total_positions", 1)
+        path.write_text("# Written by `python -m tradebot setup`. See config.example.yaml for every option.\n"
+                        + yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        new_cfg = load_config(str(path))
+        print(f"\nSaved your settings to {path}.")
+
+        print("\nChecking what this account can trade ...")
+        report = _symbol_report(new_cfg, broker, symbol, acct)
+        print("\nAll set. Next:")
+        print("  - 3-TEST-WITHOUT-TRADING.bat : watch the bot think for a few candles, no orders")
+        print("  - 4-START-TRADING.bat        : start trading" +
+              (" (allowed on this real account)" if not acct.is_demo and allow_live else ""))
+        if "WILL NOT" in report:
+            print("  ! With these settings the bot cannot open trades on this account (see 'Account fit' above).")
     finally:
         broker.shutdown()
     return 0
@@ -228,6 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("setup", help="guided set-up: connect to MT5, pick gold, write config.yaml")
     sub.add_parser("check", help="test the MT5 connection")
     live = sub.add_parser("live", help="run the bot on MT5")
     live.add_argument("--dry-run", action="store_true", help="log decisions only, never send orders")
@@ -261,14 +403,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     config_path = args.config if Path(args.config).exists() else None
-    if config_path is None and args.config != "config.yaml":
+    if config_path is None and args.config != "config.yaml" and args.command != "setup":
         print(f"Config file {args.config} not found", file=sys.stderr)
         return 2
     cfg = load_config(config_path)
     setup_logging(cfg.paths.log_dir, args.verbose, to_file=args.command in ("live", "check"))
-    if config_path is None:
+    if config_path is None and args.command != "setup":
         log.info("No config.yaml found - using defaults (copy config.example.yaml to config.yaml)")
-    handlers = {"check": cmd_check, "live": cmd_live, "backtest": cmd_backtest,
+    handlers = {"setup": cmd_setup, "check": cmd_check, "live": cmd_live, "backtest": cmd_backtest,
                 "export": cmd_export, "status": cmd_status, "readiness": cmd_readiness}
     try:
         return handlers[args.command](cfg, args)

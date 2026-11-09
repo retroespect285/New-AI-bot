@@ -15,6 +15,59 @@ that grows every 5 minutes and is reloaded after every restart.
 
 ---
 
+## Quick start (no programming needed)
+
+**How the bot connects to MT5.** This is *not* an Expert Advisor: you don't drag anything onto an MT5
+chart. It's a separate program that runs in its own black window **on the same Windows computer**
+as MetaTrader 5. It finds the open MT5 terminal by itself and trades the account MT5 is logged in to.
+There are no passwords to type and no API keys.
+
+```
+ ┌──────────────────────┐   talks to    ┌──────────────────────────────┐   orders   ┌────────┐
+ │ New-AI-bot (window)  │ ────────────▶ │ MetaTrader 5 (open, logged in)│ ─────────▶ │ broker │
+ └──────────────────────┘ ◀──────────── └──────────────────────────────┘ ◀───────── └────────┘
+        same Windows PC       prices, account, positions
+```
+
+**1. Prepare MetaTrader 5** (one time)
+- Open MT5 and log in to the account you want the bot to trade.
+- **Tools → Options → Expert Advisors** → tick **Allow algorithmic trading** → OK.
+- Click the **Algo Trading** button in the top toolbar so it turns **green**.
+- **Tools → Options → Charts** → **Max bars in chart** → **Unlimited** → OK.
+
+**2. Install Python** (one time): download **Python 3.12** from
+[python.org/downloads](https://www.python.org/downloads/), run it, and on the first screen **tick
+"Add python.exe to PATH"**, then click *Install Now*.
+
+**3. Download the bot**: on GitHub, choose the branch **`claude/mt5-trading-bot-winusp`**, click the
+green **Code** button → **Download ZIP**, and unzip it, for example to `C:\New-AI-bot`.
+
+**4. Double-click the files in the folder, in this order:**
+
+| file | what happens |
+|---|---|
+| `1-INSTALL-AND-SETUP.bat` | installs everything (a few minutes the first time), connects to MT5, **lists the gold symbols it finds; type the number of yours**, asks how much one losing trade may cost (press Enter for the suggestion) and, on a real account, whether it may trade real money. Then it writes the settings and shows whether your account can afford the trades. |
+| `2-CHECK-CONNECTION.bat` | any time: shows the connection, account, gold price and the **Account fit** check |
+| `3-TEST-WITHOUT-TRADING.bat` | the bot studies the charts (a few minutes), then prints its decision every 5 minutes **without placing orders**. Watch a few candles, then press **Ctrl+C** |
+| `4-START-TRADING.bat` | starts trading. **Keep this window and MT5 open.** Press **Ctrl+C** to stop |
+
+If Windows shows "Windows protected your PC", click **More info → Run anyway**.
+
+**When something goes wrong**
+
+| message | what to do |
+|---|---|
+| `Python was not found` | install Python 3.12 with "Add python.exe to PATH" ticked, then run file 1 again |
+| `Could not connect to MetaTrader 5` | open MT5 and log in first. If you have several MT5 installations, run file 1 again and paste the path of `terminal64.exe` when asked |
+| `Algo Trading is DISABLED` / `Algo Trading is switched OFF` | click the **Algo Trading** button in MT5 so it is green |
+| `No gold symbol found` | in MT5: View → Market Watch → right-click → Symbols → search XAU or GOLD → Show Symbol, then run file 1 again |
+| `THE BOT WILL NOT OPEN TRADES ON THIS ACCOUNT` | the account is too small for even the smallest gold trade; see [Small accounts](#small-accounts-eg-20) |
+| `This is a REAL-MONEY account ... allow_live_account` | run file 1 again and answer **yes** to the real-money question |
+
+The rest of this README explains how the bot works and every option.
+
+---
+
 ## What it does every 5 minutes
 
 ```
@@ -182,18 +235,16 @@ VPS) as the MT5 terminal.
 3. In MT5: **Tools → Options → Charts → Max bars in chart → Unlimited** (the bot studies history).
 4. Show gold in **Market Watch** (right-click → Symbols → search "XAU" or "GOLD"). Note its exact
    name: `XAUUSD`, `GOLD`, `XAUUSD.m`, `XAUUSDm`...
-5. Install **Python 3.10–3.13** from python.org (tick *"Add Python to PATH"*).
-6. Get this project and run the one-time setup:
-   ```bat
-   git clone https://github.com/retroespect285/New-AI-bot.git
-   cd New-AI-bot
-   scripts\install.bat
-   ```
-   (Or by hand: `python -m venv .venv`, `.venv\Scripts\activate`, `pip install -r requirements.txt`,
-   `copy config.example.yaml config.yaml`.)
-7. Edit `config.yaml`: set `trading.symbols` to your broker's gold name. If you want the bot to log
-   in by itself, copy `.env.example` to `.env` and fill in `MT5_LOGIN`, `MT5_PASSWORD`,
-   `MT5_SERVER`. Otherwise it uses whatever account the terminal is logged in to.
+5. Install **Python 3.12** from python.org (3.10–3.14 also work; tick *"Add python.exe to PATH"*).
+6. Get this project (Download ZIP of branch `claude/mt5-trading-bot-winusp`, or
+   `git clone https://github.com/retroespect285/New-AI-bot.git` then `git checkout claude/mt5-trading-bot-winusp`)
+   and double-click **`1-INSTALL-AND-SETUP.bat`**. It installs everything and runs the guided
+   `python -m tradebot setup`, which writes `config.yaml` for you.
+   (By hand instead: `python -m venv .venv`, `.venv\Scripts\activate`, `pip install -r requirements.txt`,
+   `copy config.example.yaml config.yaml` and edit it.)
+7. Optional: to have the bot log in by itself, copy `.env.example` to `.env` and fill in
+   `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`. Otherwise it uses whatever account the terminal is
+   logged in to.
 
 ## Usage
 
@@ -201,11 +252,12 @@ Run commands from the project folder with the virtual environment active (`.venv
 
 | step | command | what it does |
 |---|---|---|
+| 0 | `python -m tradebot setup` | guided set-up (what file 1 runs): finds gold, asks two questions, writes `config.yaml` |
 | 1 | `python -m tradebot check` | tests the connection; shows account (DEMO/REAL), gold spec, spread, and how much M1/M5/M30/H1/H4 history MT5 has |
 | 2 | `python -m tradebot export --days 180` | downloads all five charts to `data\XAUUSD_M1.csv` ... `data\XAUUSD_H4.csv` |
 | 3 | `python -m tradebot backtest --csv data\XAUUSD_M5.csv` | walk-forward backtest (reads the other four files from the same folder) |
 | 4 | `python -m tradebot live --dry-run` | studies history, then follows the live market and logs decisions, **no orders** |
-| 5 | `python -m tradebot live` (or `scripts\run_bot.bat`) | trades the demo account. Ctrl+C stops it cleanly |
+| 5 | `python -m tradebot live` (or `4-START-TRADING.bat`) | trades the account MT5 is logged in to. Ctrl+C stops it cleanly |
 | – | `python -m tradebot status` | what the brain has learned, day by day |
 | – | `python -m tradebot readiness` | does the demo record justify real money? |
 
@@ -281,8 +333,8 @@ may refuse the order for lack of margin anyway.
 **Use a cent account.** Many brokers offer them for MT5: the balance is shown in US cents
 ($20 = 2,000 USC) and trades are 100× smaller, so the same trade risks a few cents and the bot can
 manage risk normally. Then:
-1. `copy config.cent-account.yaml config.yaml` and set `trading.symbols` to the cent gold name
-   (often `XAUUSDc`);
+1. run `1-INSTALL-AND-SETUP.bat` and pick the cent gold symbol (often `XAUUSDc`). Or
+   `copy config.cent-account.yaml config.yaml` and set `trading.symbols` by hand;
 2. run `python -m tradebot check`. It ends with an **Account fit** report: for every trade style, what
    the smallest possible trade would risk on *your* account right now, the margin needed, and whether
    the bot can trade. The same report is printed when `live` starts.
@@ -291,7 +343,7 @@ If a trade is skipped for size or margin, `logs/decisions.csv` says so with the 
 
 ## Running it 24/5
 * Run it on a **Windows VPS** close to your broker's server, so it doesn't depend on your home PC.
-* Use `scripts\run_bot.bat` with Windows Task Scheduler ("At log on") to restart after reboots. It
+* Use `4-START-TRADING.bat` with Windows Task Scheduler ("At log on") to restart after reboots. It
   resumes from the brain file, and SL/TP stay on the broker's server in the meantime.
 * Check `logs/bot.log`, `logs/closed.csv` and `python -m tradebot status` regularly.
 

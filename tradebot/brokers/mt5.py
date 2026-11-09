@@ -51,6 +51,29 @@ _DEFAULTS = {
     "POSITION_TYPE_SELL": 1,
 }
 _DEAL_REASONS = {0: "manual", 1: "manual", 2: "manual", 3: "bot", 4: "sl", 5: "tp", 6: "stop_out"}
+# What common MT5 refusals mean, in plain words
+_RETCODE_HINTS = {
+    10006: "the broker rejected the order",
+    10013: "invalid request",
+    10014: "this lot size is not allowed for this symbol/account",
+    10015: "invalid price (market moving fast) - will retry next candle",
+    10016: "stop-loss / take-profit too close to the price for this broker",
+    10017: "trading is disabled for this symbol or account",
+    10018: "the market is closed",
+    10019: "not enough money / margin in the account",
+    10026: "the broker has disabled algorithmic trading on this account",
+    10027: "Algo Trading is switched OFF in MT5 - click the 'Algo Trading' button in the toolbar (it must be green)",
+    10031: "MT5 has no connection to the broker",
+    10040: "the broker's limit on open positions is reached",
+    10044: "this symbol only allows closing positions",
+}
+CONNECT_HELP = (
+    "Make sure that:\n"
+    "  1. MetaTrader 5 is installed on THIS computer and is OPEN;\n"
+    "  2. you are logged in to your account (bottom-right corner of MT5 shows a connection, not 'No connection');\n"
+    "  3. if MT5 is installed in an unusual folder, or you have several MT5 terminals, put the full path of\n"
+    "     terminal64.exe in config.yaml under mt5: path:  (or run 1-INSTALL-AND-SETUP.bat again)."
+)
 _COMMENT_MAX = 31
 
 
@@ -99,7 +122,7 @@ class MT5Broker(Broker):
         path = kwargs.pop("path", None)
         ok = self.mt5.initialize(path, **kwargs) if path else self.mt5.initialize(**kwargs)
         if not ok:
-            raise BrokerError(f"MT5 initialize() failed: {self._err()}. Is the terminal installed and logged in?")
+            raise BrokerError(f"Could not connect to MetaTrader 5 ({self._err()}).\n{CONNECT_HELP}")
         term = self.mt5.terminal_info()
         acc = self.mt5.account_info()
         if acc is None:
@@ -249,7 +272,9 @@ class MT5Broker(Broker):
                 request["price"] = tick.ask if buy else tick.bid
                 continue
             break
-        return OrderResult(False, retcode=int(result.retcode), message=f"rejected: {result.comment} (retcode {result.retcode})")
+        hint = _RETCODE_HINTS.get(int(result.retcode), "")
+        return OrderResult(False, retcode=int(result.retcode),
+                           message=f"rejected: {hint + ' - ' if hint else ''}{result.comment} (retcode {result.retcode})")
 
     def open_position(self, symbol: str, side: Side, volume: float, sl: float, tp: float,
                       magic: int, comment: str = "", deviation: int = 20) -> OrderResult:
@@ -302,6 +327,19 @@ class MT5Broker(Broker):
             "type_time": self.c("ORDER_TIME_GTC"),
         }
         return self._send(request, position.symbol)
+
+    def find_symbols(self, words) -> List[tuple]:
+        """(name, description) of every symbol whose name or description contains one of ``words``."""
+        found = self.mt5.symbols_get()
+        if not found:
+            return []
+        words = [w.lower() for w in words]
+        out = []
+        for s in found:
+            name, desc = str(s.name), str(getattr(s, "description", ""))
+            if any(w in name.lower() or w in desc.lower() for w in words):
+                out.append((name, desc))
+        return sorted(out, key=lambda nd: (len(nd[0]), nd[0]))
 
     def margin_required(self, symbol: str, side: Side, volume: float, price: float) -> Optional[float]:
         order_type = self.c("ORDER_TYPE_BUY") if side is Side.BUY else self.c("ORDER_TYPE_SELL")

@@ -37,6 +37,7 @@ Acc = namedtuple("Acc", "login server balance equity margin_free currency trade_
 Term = namedtuple("Term", "connected trade_allowed")
 Result = namedtuple("Result", "retcode order deal volume price comment")
 Pos = namedtuple("Pos", "ticket symbol type magic volume price_open sl tp time profit comment")
+SymT = namedtuple("SymT", "name description")
 Deal = namedtuple("Deal", "ticket position_id symbol type entry magic volume price profit commission swap fee time reason")
 
 
@@ -54,6 +55,9 @@ class State:
         self.filling_mode = SYMBOL_FILLING_FOK | SYMBOL_FILLING_IOC
         self.now = 1_700_000_100  # open time of the M5 bar that is currently forming
         self.margin_per_lot = 220.0
+        self.symbols = [SymT("EURUSD", "Euro vs US Dollar"), SymT("XAUUSD", "Gold vs US Dollar"),
+                        SymT("XAUUSDc", "Gold vs US Dollar (cent)"), SymT("US30", "Dow Jones")]
+        self.init_ok = True
         self.equity = 10050.0
 
 
@@ -62,7 +66,11 @@ state = State()
 
 def initialize(*args, **kwargs):
     state.initialized_with = (args, kwargs)
-    return True
+    return state.init_ok
+
+
+def symbols_get(group=None):
+    return tuple(state.symbols)
 
 
 def shutdown():
