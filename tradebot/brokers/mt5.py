@@ -303,6 +303,14 @@ class MT5Broker(Broker):
         }
         return self._send(request, position.symbol)
 
+    def margin_required(self, symbol: str, side: Side, volume: float, price: float) -> Optional[float]:
+        order_type = self.c("ORDER_TYPE_BUY") if side is Side.BUY else self.c("ORDER_TYPE_SELL")
+        try:
+            margin = self.mt5.order_calc_margin(order_type, symbol, float(volume), float(price))
+        except Exception:  # pragma: no cover - older terminals
+            return None
+        return None if margin is None else float(margin)
+
     # ------------------------------------------------------------------ history
     def closed_trades(self, since: pd.Timestamp, magic: int, position_ids: Iterable[int] = ()) -> List[ClosedTrade]:
         known = {int(p) for p in position_ids}

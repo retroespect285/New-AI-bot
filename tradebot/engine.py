@@ -12,6 +12,8 @@ from .brokers.base import Broker, BrokerError
 from .config import BotConfig
 from .core import BotCore
 from .journal import Journal
+from .types import Side
+from .fit import assess_fit, fit_report, latest_atr
 from .readiness import assess
 
 log = logging.getLogger(__name__)
@@ -73,6 +75,7 @@ class LiveEngine:
             core.warmup(symbol, bars, context)
             self._last_bar[symbol] = bars["time"].iat[-1]
             self._log_model(core, symbol)
+            self._log_fit(symbol, info, acct, {cfg.trading.timeframe: bars, **context})
         core.save_state()
         self.core = core
         return core
@@ -141,6 +144,18 @@ class LiveEngine:
         if self._bars_seen[symbol] % 144 == 0:  # periodic brain report (every 12 hours on M5)
             self._log_model(core, symbol)
         return True
+
+    def _log_fit(self, symbol, info, acct, bars_by_tf) -> None:
+        """Warn loudly if the account is too small for even the smallest trade."""
+        cfg = self.cfg
+        rows = assess_fit(info, cfg.model.styles, latest_atr(bars_by_tf, cfg.model.atr_period),
+                          acct.equity, cfg.risk.risk_per_trade_pct)
+        tick = self.broker.get_tick(symbol)
+        margin = self.broker.margin_required(symbol, Side.BUY, info.volume_min, tick.ask)
+        report = fit_report(rows, acct.equity, acct.currency, cfg.risk.risk_per_trade_pct, margin, acct.margin_free)
+        trouble = "WILL NOT" in report or "skipped" in report
+        for line in report.splitlines():
+            (log.warning if trouble else log.info)("%s %s", symbol, line)
 
     @staticmethod
     def _log_model(core: BotCore, symbol: str) -> None:

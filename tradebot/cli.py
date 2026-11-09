@@ -67,10 +67,17 @@ def _symbol_info(cfg: BotConfig, symbol: str, csv_path: str = None) -> SymbolInf
     return SymbolInfo(name=symbol, **spec)
 
 
-def cmd_check(cfg: BotConfig, args) -> int:
+def _mt5_broker(cfg: BotConfig):
     from .brokers.mt5 import MT5Broker
 
-    broker = MT5Broker(cfg.mt5)
+    return MT5Broker(cfg.mt5)
+
+
+def cmd_check(cfg: BotConfig, args) -> int:
+    from .fit import assess_fit, fit_report, latest_atr
+    from .types import Side
+
+    broker = _mt5_broker(cfg)
     broker.connect()
     try:
         acct = broker.account()
@@ -81,12 +88,18 @@ def cmd_check(cfg: BotConfig, args) -> int:
             tick = broker.get_tick(symbol)
             print(f"{symbol}: bid {tick.bid} ask {tick.ask} spread {tick.spread / info.point:.0f} points | "
                   f"spec {info.to_dict()}")
+            by_tf = {}
             for tf in [cfg.trading.timeframe] + cfg.model.context_timeframes:
                 want = (cfg.trading.warmup_bars if tf == cfg.trading.timeframe
                         else cfg.context_fetch_bars(tf, cfg.trading.warmup_bars))
                 bars = broker.get_rates(symbol, tf, want)
+                by_tf[tf] = bars
                 print(f"  {tf:>4}: {len(bars):6d} of {want} wanted closed bars "
                       f"({bars['time'].iat[0]} -> {bars['time'].iat[-1]})")
+            rows = assess_fit(info, cfg.model.styles, latest_atr(by_tf, cfg.model.atr_period), acct.equity,
+                              cfg.risk.risk_per_trade_pct)
+            margin = broker.margin_required(symbol, Side.BUY, info.volume_min, tick.ask)
+            print(fit_report(rows, acct.equity, acct.currency, cfg.risk.risk_per_trade_pct, margin, acct.margin_free))
         positions = broker.positions(magic=cfg.trading.magic)
         print(f"Open positions of this bot (magic {cfg.trading.magic}): {len(positions)}")
     finally:
@@ -95,21 +108,19 @@ def cmd_check(cfg: BotConfig, args) -> int:
 
 
 def cmd_live(cfg: BotConfig, args) -> int:
-    from .brokers.mt5 import MT5Broker
     from .engine import LiveEngine
 
-    engine = LiveEngine(cfg, MT5Broker(cfg.mt5), dry_run=args.dry_run)
+    engine = LiveEngine(cfg, _mt5_broker(cfg), dry_run=args.dry_run)
     engine.run(max_cycles=args.max_cycles)
     return 0
 
 
 def cmd_export(cfg: BotConfig, args) -> int:
-    from .brokers.mt5 import MT5Broker
     from .data import save_bars
 
     from .config import TIMEFRAME_MINUTES
 
-    broker = MT5Broker(cfg.mt5)
+    broker = _mt5_broker(cfg)
     broker.connect()
     try:
         for symbol in args.symbol or cfg.trading.symbols:

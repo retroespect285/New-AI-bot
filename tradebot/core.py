@@ -190,7 +190,7 @@ class BotCore:
             if blocked:
                 decision.reason = f"blocked: {blocked}"
             else:
-                self._execute(symbol, info, decision, tick, acct.equity, fs.atr_tf[decision.arm.tf][i], bar_close)
+                self._execute(symbol, info, decision, tick, acct, fs.atr_tf[decision.arm.tf][i], bar_close)
         self._journal_decision(symbol, bar_close, decision)
         return decision
 
@@ -329,9 +329,10 @@ class BotCore:
         return ""
 
     def _execute(self, symbol: str, info: SymbolInfo, decision: Decision, tick: Tick,
-                 equity: float, atr_i: float, now: pd.Timestamp) -> None:
+                 acct: AccountInfo, atr_i: float, now: pd.Timestamp) -> None:
         cfg = self.cfg
         arm = decision.arm
+        equity = acct.equity
         if arm.side is Side.BUY:
             price = tick.ask
             sl, tp = price - arm.sl_atr * atr_i, price + arm.tp_atr * atr_i
@@ -347,7 +348,14 @@ class BotCore:
         if ok:
             lots, risk_money = self.risk.position_size(equity, info, sl_dist)
             if lots <= 0:
-                ok, why = False, "minimum lot size would exceed the risk budget"
+                min_risk = sl_dist * info.value_per_price_unit * info.volume_min
+                ok, why = False, (f"minimum lot size would exceed the risk budget: {info.volume_min:g} lot "
+                                  f"risks {min_risk:.2f} = {100 * min_risk / max(equity, 1e-9):.1f}% of equity "
+                                  f"(limit {cfg.risk.risk_per_trade_pct:g}%)")
+        if ok:
+            margin = self.broker.margin_required(symbol, arm.side, lots, price)
+            if margin is not None and margin > acct.margin_free * 0.9:
+                ok, why = False, f"not enough free margin (needs {margin:.2f}, free {acct.margin_free:.2f})"
         if not ok:
             decision.reason = f"blocked: {why}"
             return

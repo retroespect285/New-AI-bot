@@ -54,6 +54,10 @@ class Broker(ABC):
     @abstractmethod
     def close_position(self, position: Position, comment: str = "", deviation: int = 20) -> OrderResult: ...
 
+    def margin_required(self, symbol: str, side: Side, volume: float, price: float) -> Optional[float]:
+        """Margin (account currency) needed to open ``volume`` lots, or None if unknown."""
+        return None
+
     @abstractmethod
     def closed_trades(self, since: pd.Timestamp, magic: int,
                       position_ids: Iterable[int] = ()) -> List[ClosedTrade]:

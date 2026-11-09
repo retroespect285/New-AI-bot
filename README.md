@@ -272,6 +272,23 @@ The thresholds are in `readiness:` in `config.yaml`. When you do switch:
    because the demo's equity peak must not trigger the live kill switch. On a real account the
    readiness report is printed at start-up.
 
+## Small accounts (e.g. $20)
+The bot never risks more than `risk_per_trade_pct` of the account on one trade. On a **standard**
+account the smallest gold trade (0.01 lot = 1 ounce) loses **$3–15** when its stop is hit, which is
+**15–75% of $20**. So on a $20 standard account the bot will refuse every trade, and the broker
+may refuse the order for lack of margin anyway.
+
+**Use a cent account.** Many brokers offer them for MT5: the balance is shown in US cents
+($20 = 2,000 USC) and trades are 100× smaller, so the same trade risks a few cents and the bot can
+manage risk normally. Then:
+1. `copy config.cent-account.yaml config.yaml` and set `trading.symbols` to the cent gold name
+   (often `XAUUSDc`);
+2. run `python -m tradebot check`. It ends with an **Account fit** report: for every trade style, what
+   the smallest possible trade would risk on *your* account right now, the margin needed, and whether
+   the bot can trade. The same report is printed when `live` starts.
+
+If a trade is skipped for size or margin, `logs/decisions.csv` says so with the numbers.
+
 ## Running it 24/5
 * Run it on a **Windows VPS** close to your broker's server, so it doesn't depend on your home PC.
 * Use `scripts\run_bot.bat` with Windows Task Scheduler ("At log on") to restart after reboots. It

@@ -1,0 +1,22 @@
+# Settings for a SMALL live account (e.g. $20) on a CENT account.
+# Copy this file to config.yaml. Anything not listed here uses the normal defaults
+# (see config.example.yaml).
+#
+# Why a cent account: on a standard account the smallest gold trade (0.01 lot = 1 ounce) loses
+# $3-15 when its stop is hit - 15-75% of $20 - so the bot would refuse every trade. On a cent
+# account the balance is shown in US cents ($20 = 2,000 USC) and trades are 100x smaller, so the
+# same trade risks a few cents and normal risk control works.
+
+mt5:
+  allow_live_account: true   # you have chosen to trade real money
+
+trading:
+  # Gold on cent accounts usually has a suffix, e.g. XAUUSDc. Use the exact name from MT5's
+  # Market Watch of your cent account.
+  symbols: [XAUUSDc]
+
+risk:
+  risk_per_trade_pct: 1.0    # 1% of 2,000 USC = 20 USC per trade; `check` shows which trade styles fit
+  max_total_positions: 1     # one trade at a time on a small account
+  max_daily_loss_pct: 3.0    # stop for the day after losing 3% (60 USC = $0.60)
+  max_drawdown_pct: 15.0     # stop completely after losing 15% from the peak (delete state/bot_state.json to reset)

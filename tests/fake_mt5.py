@@ -53,6 +53,8 @@ class State:
         self.deals = []
         self.filling_mode = SYMBOL_FILLING_FOK | SYMBOL_FILLING_IOC
         self.now = 1_700_000_100  # open time of the M5 bar that is currently forming
+        self.margin_per_lot = 220.0
+        self.equity = 10050.0
 
 
 state = State()
@@ -76,7 +78,11 @@ def terminal_info():
 
 
 def account_info():
-    return Acc(123, "Demo-Server", 10000.0, 10050.0, 9000.0, "USD", state.trade_mode, True)
+    return Acc(123, "Demo-Server", state.equity, state.equity, state.equity * 0.9, "USD", state.trade_mode, True)
+
+
+def order_calc_margin(action, symbol, volume, price):
+    return state.margin_per_lot * volume
 
 
 def symbol_select(symbol, enable):
