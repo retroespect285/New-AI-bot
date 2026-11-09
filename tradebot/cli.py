@@ -121,6 +121,14 @@ def cmd_check(cfg: BotConfig, args) -> int:
     return 0
 
 
+def _ask_choice(question: str, n: int, default: str) -> int:
+    while True:
+        text = _ask(question, default)
+        if text.isdigit() and 1 <= int(text) <= n:
+            return int(text)
+        print(f"  Please type a number from 1 to {n}.")
+
+
 def _ask(question: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
     try:
@@ -217,9 +225,14 @@ def cmd_setup(cfg: BotConfig, args) -> int:
 
     from .brokers.base import BrokerError
 
+    from .config import ACTIVITY_LEVELS, config_from_dict
+
     path = Path(args.config)
+    data = {}
+    if path.exists():
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     print("\n=== New-AI-bot set-up ===")
-    print("Step 1 of 4: connecting to MetaTrader 5 on this computer ...")
+    print("Step 1 of 5: connecting to MetaTrader 5 on this computer ...")
     broker = _mt5_broker(cfg)
     try:
         broker.connect()
@@ -245,7 +258,7 @@ def cmd_setup(cfg: BotConfig, args) -> int:
         print(f"  Connected: account {acct.login}, balance {acct.balance:,.2f} {acct.currency} ({kind})")
         cent = acct.currency.upper() in ("USC", "EUC", "GBC") or "cent" in acct.currency.lower()
 
-        print("\nStep 2 of 4: which gold symbol should the bot trade?")
+        print("\nStep 2 of 5: which gold symbol should the bot trade?")
         symbols = broker.find_symbols(["XAU", "GOLD"])
         symbol = None
         if symbols:
@@ -274,7 +287,31 @@ def cmd_setup(cfg: BotConfig, args) -> int:
         broker.symbol_info(symbol)  # makes sure MT5 shows it in Market Watch
         print(f"  Using {symbol}")
 
-        print("\nStep 3 of 4: how much of the account may one losing trade cost?")
+        print("\nStep 3 of 5: how fast and how actively should the bot trade?")
+        print("  1) every 1 minute  (M1: reads M1 + M5/M30/H1/H4; trades lasting 30 minutes to 4 hours)")
+        print("  2) every 5 minutes (M5: reads M1/M5/M30/H1/H4; trades lasting 1 to 8 hours)")
+        speed = _ask_choice("Type 1 or 2", 2, "1" if cfg.trading.timeframe == "M1" else "2")
+        timeframe = "M1" if speed == 1 else "M5"
+        print("\n  How picky should it be before trading? Every level still needs the model to expect a profit")
+        print("  after the spread; they differ in how much PROOF it needs that its forecasts work:")
+        print("  1) careful  - only setups proven on recent data. Fewest trades.")
+        print("  2) balanced - setups no worse than guessing and recently profitable in paper trading.")
+        print("  3) active   - trades whenever the model expects a profit, no track record needed. Most trades,")
+        print("                and the most likely to lose: on random prices it trades (and pays the spread) too.")
+        levels = list(ACTIVITY_LEVELS)
+        current = cfg.model.activity if cfg.model.activity in levels else "careful"
+        activity = levels[_ask_choice("Type 1, 2 or 3", 3, str(levels.index(current) + 1)) - 1]
+        print(f"  Every {'1 minute' if timeframe == 'M1' else '5 minutes'}, activity: {activity}.")
+        model = data.setdefault("model", {})
+        for key in ("styles", "context_timeframes", "outlooks", "activity", *ACTIVITY_LEVELS["careful"]):
+            model.pop(key, None)  # managed by the speed / activity choice
+        for key in ("warmup_bars", "save_models_every", "poll_seconds"):
+            (data.get("trading") or {}).pop(key, None)
+        data.setdefault("trading", {})["timeframe"] = timeframe
+        model["activity"] = activity
+        prov_cfg = config_from_dict(data).validate()
+
+        print("\nStep 4 of 5: how much of the account may one losing trade cost?")
         default_risk = "1.0" if cent or acct.equity < 500 else "0.5"
         print(f"  (in percent; {default_risk} is suggested{' for a cent / small account' if default_risk == '1.0' else ''}"
               f"; the maximum allowed is 5)")
@@ -290,10 +327,10 @@ def cmd_setup(cfg: BotConfig, args) -> int:
             else:
                 print("  Please type a number between 0.1 and 5.")
 
-        small = _small_account_step(cfg, broker, symbol, acct, risk)
+        small = _small_account_step(prov_cfg, broker, symbol, acct, risk)
 
         allow_live = cfg.mt5.allow_live_account
-        print("\nStep 4 of 4: real money")
+        print("\nStep 5 of 5: real money")
         if acct.is_demo:
             print("  This is a demo account - nothing to confirm.")
         else:
@@ -302,9 +339,7 @@ def cmd_setup(cfg: BotConfig, args) -> int:
             allow_live = answer in ("y", "yes")
             print("  Allowed." if allow_live else "  Not allowed - the bot will only watch (dry run) on this account.")
 
-        data = {}
         if path.exists():
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
             shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
         data.setdefault("mt5", {})
         data["mt5"]["allow_live_account"] = bool(allow_live)
@@ -320,10 +355,15 @@ def cmd_setup(cfg: BotConfig, args) -> int:
                 data.setdefault("model", {})["styles"] = small["styles"]
         elif data.get("risk", {}).get("min_lot_max_risk_pct") is not None:
             data["risk"]["min_lot_max_risk_pct"] = None  # small-account mode switched off
+        if not data.get("model"):
+            data.pop("model", None)
         path.write_text("# Written by `python -m tradebot setup`. See config.example.yaml for every option.\n"
                         + yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
         new_cfg = load_config(str(path))
         print(f"\nSaved your settings to {path}.")
+        if timeframe != cfg.trading.timeframe or len(new_cfg.model.styles) != len(cfg.model.styles):
+            print("  The bot will study history again at the next start (new speed or trade styles): "
+                  + ("about 20 minutes for the 1-minute set-up." if timeframe == "M1" else "about 10 minutes."))
 
         print("\nChecking what this account can trade ...")
         report = _symbol_report(new_cfg, broker, symbol, acct)

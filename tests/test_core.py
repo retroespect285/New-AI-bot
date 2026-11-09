@@ -217,3 +217,29 @@ def test_multi_timeframe_live_engine_and_style_stops(tmp_path, monkeypatch):
     assert abs((req["price"] - req["sl"]) - atr_h1) < 2e-5
     assert core.open_risk[555]["arm"] == h1_arm.key
     engine.journal.close()
+
+
+def test_live_engine_in_one_minute_mode(tmp_path):
+    from tradebot.config import config_from_dict
+
+    fake_mt5.state.reset()
+    cfg = config_from_dict({
+        "trading": {"timeframe": "M1", "symbols": ["EURUSD"], "warmup_bars": 2500, "lookback_bars": 900,
+                    "friday_cutoff_hour": None, "session": {"start_hour": 0, "end_hour": 24}},
+        "model": {"activity": "active", "min_train_samples": 300, "gbm_window": 600, "gbm_refit_every": 500,
+                  "gbm_max_iter": 20},
+        "paths": {"state_dir": str(tmp_path / "state"), "log_dir": str(tmp_path / "logs")},
+    }).validate()
+    engine = LiveEngine(cfg, MT5Broker(cfg.mt5, module=fake_mt5))
+    core = engine.start()
+    brain = core.brains["EURUSD"]
+    assert brain.bar_ns == 60 * 1_000_000_000
+    assert any(n.startswith("m5_") for n in brain.feature_names) and not any(n.startswith("m1_") for n in brain.feature_names)
+    assert set(brain.outlook_horizons) == {"M1", "M5", "M30", "H1", "H4"}
+    fake_mt5.state.now += 60  # one minute later a new M1 candle has closed
+    assert engine._process_symbol(core, "EURUSD")
+    assert not engine._process_symbol(core, "EURUSD")  # nothing new until the next minute
+    engine.journal.close()
+    assert (tmp_path / "state" / "brain_EURUSD_M1.joblib").exists()
+    d = pd.read_csv(tmp_path / "logs" / "decisions.csv")
+    assert len(d) == 1 and "up_M1" in d.columns

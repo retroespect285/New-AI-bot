@@ -18,7 +18,7 @@ def _run(tmp_path, monkeypatch, answers):
 
 def test_setup_on_a_demo_account_with_defaults(tmp_path, monkeypatch, capsys):
     fake_mt5.state.reset()
-    assert _run(tmp_path, monkeypatch, ["", ""]) == 0  # press Enter twice
+    assert _run(tmp_path, monkeypatch, ["", "", "", ""]) == 0  # press Enter for everything
     out = capsys.readouterr().out
     assert "1) XAUUSD" in out and "2) XAUUSDc" in out and "EURUSD" not in out.split("Step 2")[1].split("Using")[0]
     cfg = load_config(str(tmp_path / "config.yaml"))
@@ -35,7 +35,7 @@ def test_setup_on_a_small_real_cent_account(tmp_path, monkeypatch, capsys):
     fake_mt5.state.equity = 20.0
     (tmp_path / "config.yaml").write_text("risk:\n  max_daily_loss_pct: 2.0\n")
     # symbol 2, default risk, small-account mode: no (the fake symbol isn't really a cent symbol), real money: yes
-    assert _run(tmp_path, monkeypatch, ["2", "", "no", "yes"]) == 0
+    assert _run(tmp_path, monkeypatch, ["2", "", "", "", "no", "yes"]) == 0
     data = yaml.safe_load((tmp_path / "config.yaml").read_text())
     assert data["trading"]["symbols"] == ["XAUUSDc"]
     assert data["risk"]["risk_per_trade_pct"] == 1.0  # suggested for a small account
@@ -69,7 +69,7 @@ def test_order_rejection_is_explained(monkeypatch):
 def test_setup_on_a_too_small_account_says_so(tmp_path, monkeypatch, capsys):
     fake_mt5.state.reset()
     fake_mt5.state.equity = 2.0
-    assert _run(tmp_path, monkeypatch, ["", ""]) == 0
+    assert _run(tmp_path, monkeypatch, ["", "", "", ""]) == 0
     out = capsys.readouterr().out
     assert "too small for the bot to open trades" in out and "4-START-TRADING.bat" not in out
 
@@ -77,8 +77,8 @@ def test_setup_on_a_too_small_account_says_so(tmp_path, monkeypatch, capsys):
 def test_setup_offers_small_account_mode_and_writes_it(tmp_path, monkeypatch, capsys):
     fake_mt5.state.reset()
     fake_mt5.state.equity = 20.0
-    # symbol: default, risk: default (1%), small-account mode: yes, cap: suggested
-    assert _run(tmp_path, monkeypatch, ["", "", "yes", ""]) == 0
+    # symbol, speed, activity, risk: defaults; small-account mode: yes; cap: suggested
+    assert _run(tmp_path, monkeypatch, ["", "", "", "", "yes", ""]) == 0
     out = capsys.readouterr().out
     assert "SMALL-ACCOUNT MODE lets the bot trade the minimum lot" in out and "micro style" in out
     cfg = load_config(str(tmp_path / "config.yaml"))
@@ -92,7 +92,24 @@ def test_setup_offers_small_account_mode_and_writes_it(tmp_path, monkeypatch, ca
 def test_setup_small_account_mode_declined(tmp_path, monkeypatch, capsys):
     fake_mt5.state.reset()
     fake_mt5.state.equity = 20.0
-    assert _run(tmp_path, monkeypatch, ["", "", "no"]) == 0
+    assert _run(tmp_path, monkeypatch, ["", "", "", "", "no"]) == 0
     cfg = load_config(str(tmp_path / "config.yaml"))
     assert cfg.risk.min_lot_max_risk_pct is None and len(cfg.model.styles) == 3
     assert "too small for the bot to open trades" in capsys.readouterr().out
+
+
+def test_setup_every_minute_and_active(tmp_path, monkeypatch, capsys):
+    fake_mt5.state.reset()
+    # symbol 1, speed 1 (every minute), activity 3 (active), default risk
+    assert _run(tmp_path, monkeypatch, ["1", "1", "3", ""]) == 0
+    cfg = load_config(str(tmp_path / "config.yaml"))
+    assert cfg.trading.timeframe == "M1" and cfg.model.activity == "active"
+    assert cfg.model.context_timeframes == ["M5", "M30", "H1", "H4"]
+    assert [s.timeframe for s in cfg.model.styles] == ["M1", "M5", "M30"]
+    assert cfg.model.min_skill is None and cfg.model.min_paper_trades == 0
+    out = capsys.readouterr().out
+    assert "study history again" in out and "Every 1 minute, activity: active" in out
+    # running set-up again remembers the choices as defaults
+    assert _run(tmp_path, monkeypatch, ["", "", "", ""]) == 0
+    cfg2 = load_config(str(tmp_path / "config.yaml"))
+    assert cfg2.trading.timeframe == "M1" and cfg2.model.activity == "active"

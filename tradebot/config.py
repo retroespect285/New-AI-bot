@@ -114,7 +114,10 @@ class ModelConfig:
     styles: List[TradeStyle] = field(default_factory=_gold_styles)
     min_train_samples: int = 1500  # learned samples before a setup may trade
     min_eval_samples: int = 1000  # out-of-sample evaluations before skill is trusted
-    min_skill: float = 0.005  # required improvement over the base rate (log-loss skill score)
+    # How picky the bot is before trading: "careful", "balanced" or "active" (see ACTIVITY_LEVELS).
+    # It sets the five gates below unless you set them yourself. null = use the values below.
+    activity: Optional[str] = None
+    min_skill: Optional[float] = 0.005  # required edge over the base rate (log-loss skill); null = no check
     min_ev_r: float = 0.10  # minimum expected value, in R (multiples of the risk)
     min_prob: float = 0.0  # optional extra filter on win probability
     # Paper trading: every signal is also traded on paper (one at a time per setup). A setup may
@@ -324,6 +327,59 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+# How picky the bot is before it trades. Every level still needs the model's expected value to be
+# positive after costs; the levels differ in how much *evidence* that the forecasts work is required.
+ACTIVITY_LEVELS = {
+    # proven skill vs. guessing, EV >= 0.10R, last 20+ paper trades profitable with t-stat >= 1.5
+    "careful": dict(min_skill=0.005, min_ev_r=0.10, min_paper_trades=20, min_paper_avg_r=0.0, min_paper_tstat=1.5),
+    # no worse than guessing, EV >= 0.05R, last 10+ paper trades profitable on average
+    "balanced": dict(min_skill=0.0, min_ev_r=0.05, min_paper_trades=10, min_paper_avg_r=0.0, min_paper_tstat=0.5),
+    # trades whenever the model's own estimate says EV >= 0.02R - no track record needed
+    "active": dict(min_skill=None, min_ev_r=0.02, min_paper_trades=0, min_paper_avg_r=-1e9, min_paper_tstat=-1e9),
+}
+
+
+def timeframe_defaults(timeframe: str) -> Dict[str, Dict[str, Any]]:
+    """Settings that depend on how often the bot decides. Used for every key the config file does
+    not set itself, so ``trading: {timeframe: M1}`` alone gives a complete 1-minute set-up."""
+    if timeframe == "M1":
+        return {
+            "model": {
+                "context_timeframes": ["M5", "M30", "H1", "H4"],
+                "outlooks": ["M1", "M5", "M30", "H1", "H4"],
+                "styles": [
+                    TradeStyle("M1", 1.0, 1.5, 30),    # micro: 1-minute moves, up to 30 minutes
+                    TradeStyle("M5", 1.5, 2.0, 60),    # scalp: up to 1 hour
+                    TradeStyle("M30", 1.0, 1.5, 240),  # intraday: up to 4 hours
+                ],
+                "gbm_refit_every": 1440,  # re-train the trees once a day
+                "min_train_samples": 3000,
+            },
+            "trading": {"warmup_bars": 40000, "save_models_every": 60, "poll_seconds": 2.0},
+        }
+    return {}
+
+
+def config_from_dict(data: Optional[dict]) -> BotConfig:
+    data = data or {}
+    cfg = _build(BotConfig, data, "config")
+    given = {section: set((data.get(section) or {}).keys()) for section in ("model", "trading")}
+    for section, values in timeframe_defaults(cfg.trading.timeframe).items():
+        for key, value in values.items():
+            if key not in given[section]:
+                setattr(getattr(cfg, section), key, value)
+    level = cfg.model.activity
+    if level is not None:
+        if level not in ACTIVITY_LEVELS:
+            raise ConfigError(f"model.activity must be one of {list(ACTIVITY_LEVELS)} or null")
+        for key, value in ACTIVITY_LEVELS[level].items():
+            if key not in given["model"]:
+                setattr(cfg.model, key, value)
+    if cfg.mt5.login is not None:
+        cfg.mt5.login = int(cfg.mt5.login)
+    return cfg
+
+
 def load_config(path: Optional[str] = None) -> BotConfig:
     data: dict = {}
     if path:
@@ -333,7 +389,4 @@ def load_config(path: Optional[str] = None) -> BotConfig:
         data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         load_dotenv(p.parent / ".env")
     load_dotenv(Path.cwd() / ".env")
-    cfg = _build(BotConfig, data, "config")
-    if cfg.mt5.login is not None:
-        cfg.mt5.login = int(cfg.mt5.login)
-    return apply_env_overrides(cfg).validate()
+    return apply_env_overrides(config_from_dict(data)).validate()

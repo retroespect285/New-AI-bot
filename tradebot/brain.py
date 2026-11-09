@@ -225,8 +225,8 @@ class Brain:
         ev = p_tp * st.tp_r + p_sl * st.sl_r + p_to * st.timeout_r
         skill = l_tp.skill()
         ready = l_tp.ready() and l_sl.ready()
-        signal = (ready and math.isfinite(skill) and skill >= cfg.min_skill
-                  and p_tp >= cfg.min_prob and ev >= cfg.min_ev_r)
+        skill_ok = cfg.min_skill is None or (math.isfinite(skill) and skill >= cfg.min_skill)
+        signal = ready and skill_ok and p_tp >= cfg.min_prob and ev >= cfg.min_ev_r
         tr = self.track[arm.key]
         if signal:  # open a paper trade (one at a time per arm); scored once its outcome is known
             t = int(times[i])
@@ -360,7 +360,7 @@ class Brain:
             reason = (f"{s.arm.key} signals EV {s.ev_r:+.2f}R, but its recent paper trades average "
                       f"{s.track_r:+.2f}R over {s.track_n} (needs {cfg.min_paper_trades}+ trades, "
                       f"avg >= {cfg.min_paper_avg_r:+.2f}R, t-stat >= {cfg.min_paper_tstat})")
-        elif not any(math.isfinite(e.skill) and e.skill >= cfg.min_skill for e in evals):
+        elif cfg.min_skill is not None and not any(math.isfinite(e.skill) and e.skill >= cfg.min_skill for e in evals):
             reason = "no setup currently beats the base rate"
         else:
             best = max(evals, key=lambda e: e.ev_r)
