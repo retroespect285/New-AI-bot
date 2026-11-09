@@ -14,7 +14,9 @@ mt5:
 
 trading:
   symbols: [XAUUSD]          # exact name from MT5 Market Watch: XAUUSD, GOLD, XAUUSD.m, XAUUSDm ...
-  timeframe: M5              # the bot decides once per closed candle: M5 = every 5 minutes
+  timeframe: M5              # decides once per closed candle: M5 = every 5 minutes, M1 = every minute.
+                             # M1 switches to a 1-minute set-up automatically (context charts, styles,
+                             # forecasts, history) unless you set those keys yourself.
   magic: 285001              # tags this bot's orders so it never touches your manual trades
   dry_run: false             # true = log what it would do, never send orders
   poll_seconds: 5
@@ -56,6 +58,8 @@ model:
     # Optional: trades sized on the H4 chart, held up to 24 hours. Its results arrive a day late and
     # overlap heavily, so it learns poorly (tested); H4 is read for every decision either way.
     # - {timeframe: H4, sl_atr: 1.0, tp_atr: 1.5, max_hold_bars: 288}
+  activity: null             # careful | balanced | active: how much proof it needs before trading
+                             # (sets the five gates below unless you set them yourself; see README)
   min_train_samples: 1500    # samples learned before a setup may trade
   min_eval_samples: 1000     # out-of-sample forecasts scored before the skill score is trusted
   min_skill: 0.005           # must beat the base rate by this much (log-loss skill score)

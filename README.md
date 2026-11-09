@@ -46,7 +46,7 @@ green **Code** button → **Download ZIP**, and unzip it, for example to `C:\New
 
 | file | what happens |
 |---|---|
-| `1-INSTALL-AND-SETUP.bat` | installs everything (a few minutes the first time), connects to MT5, **lists the gold symbols it finds; type the number of yours**, asks how much one losing trade may cost (press Enter for the suggestion) and, on a real account, whether it may trade real money. Then it writes the settings and shows whether your account can afford the trades. |
+| `1-INSTALL-AND-SETUP.bat` | installs everything (a few minutes the first time), connects to MT5, **lists the gold symbols it finds; type the number of yours**, asks **how fast** (every 1 or 5 minutes) and **how actively** it should trade (careful / balanced / active, see [Speed and activity](#5-speed-and-activity-set-up-asks-both)), how much one losing trade may cost (press Enter for the suggestion) and, on a real account, whether it may trade real money. Then it writes the settings and shows whether your account can afford the trades. |
 | `2-CHECK-CONNECTION.bat` | any time: shows the connection, account, gold price and the **Account fit** check |
 | `3-TEST-WITHOUT-TRADING.bat` | the bot studies the charts (a few minutes), then prints its decision every 5 minutes **without placing orders**. Watch a few candles, then press **Ctrl+C** |
 | `4-START-TRADING.bat` | starts trading. **Keep this window and MT5 open.** Press **Ctrl+C** to stop |
@@ -221,6 +221,35 @@ and anyone promising 70–80% is not being honest.)
 * **News blackout** (optional): no new trades around NFP / CPI / FOMC (see below).
 * **Real-money guard**: the bot refuses a real account unless `mt5.allow_live_account: true`.
 * It only ever touches its own trades (`magic` number), never your manual ones.
+
+### 5. Speed and activity (set-up asks both)
+**Speed.** `trading.timeframe: M5` decides after every 5-minute candle (default). `M1` decides
+**every minute**: it reads M1 plus M5/M30/H1/H4, forecasts M1…H4, and trades a micro style (1-minute
+ATR, up to 30 minutes), an M5 scalp (up to 1 hour) and an M30 intraday style (up to 4 hours). The first
+start studies about 40,000 one-minute candles (~20 minutes).
+
+**Activity.** `model.activity` sets how much *proof* the bot needs before trading. Every level
+needs the model to expect a profit after the spread.
+
+| level | needs | trades |
+|---|---|---|
+| `careful` (default) | proven skill vs. guessing, EV ≥ 0.10R, last 20+ paper trades profitable (t ≥ 1.5) | rarely |
+| `balanced` | no worse than guessing, EV ≥ 0.05R, last 10+ paper trades profitable on average | sometimes |
+| `active` | only the model's own estimate: EV ≥ 0.02R. No track record | constantly |
+
+**Measured on 1-minute charts** (artificial gold-like prices, 10 trading days after 13 days of
+learning, 0.5% risk per trade on a $10,000 test account):
+
+| activity | random prices (nothing to find) | prices with real patterns |
+|---|---|---|
+| careful | 0 trades / 0 trades | 0 / 0 |
+| balanced | 9 trades −2.1% / 1 trade −0.5% | 0 / 0 |
+| active | **728 trades −11.1% / 758 trades −11.0%** | **543 trades −6.8% / 436 trades +2.2%** |
+
+Active trades 50–75 times a day, and on average it pays away about the spread. Trading more often
+does not create an edge; it multiplies whatever edge (or cost) there is. With small-account mode on a
+$20 account, where one losing trade costs 10–30%, active mode can lose most of the account within days.
+It is there because you may want it, not because the tests support it.
 
 ---
 
